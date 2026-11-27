@@ -425,26 +425,44 @@ async def test_web_pwa_e2e_streaming_upload_inspector_and_pc_sync(tmp_path: Path
     try:
         await asyncio.sleep(0.25)
 
-        # 1. Verify HTML & Manifest carry new "反重力助手" brand + Set-Cookie persistence
-        def _fetch_root() -> tuple[str, str]:
-            r = urllib.request.urlopen(f"http://127.0.0.1:{port}/?token={tok}", timeout=5)
-            return r.read().decode("utf-8"), (r.headers.get("Set-Cookie") or "")
+        # 1. Verify HTML & Manifest carry new "反重力助手" brand + Set-Cookie via POST /api/auth/login
+        def _fetch_root_and_login() -> tuple[str, str]:
+            r = urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5)
+            html_body = r.read().decode("utf-8")
+            req_login = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/auth/login",
+                method="POST",
+                data=b"",
+                headers={
+                    "Authorization": f"Bearer {tok}",
+                    "Origin": f"http://127.0.0.1:{port}",
+                    "Sec-Fetch-Site": "same-origin",
+                },
+            )
+            with urllib.request.urlopen(req_login, timeout=5) as resp_login:
+                assert resp_login.status == 200
+                cookie_val = resp_login.headers.get("Set-Cookie") or ""
+            return html_body, cookie_val
 
-        html_text, cookie_hdr = await asyncio.to_thread(_fetch_root)
+        html_text, cookie_hdr = await asyncio.to_thread(_fetch_root_and_login)
         assert "反重力助手" in html_text
-        assert "agy_pwa_token=" in cookie_hdr
+        assert "agy_session=" in cookie_hdr
+        assert "HttpOnly" in cookie_hdr and "SameSite=Strict" in cookie_hdr
+        assert tok not in cookie_hdr
+        sess_cookie_kv = cookie_hdr.split(";", 1)[0].strip()
 
         manifest_raw = await asyncio.to_thread(
-            lambda: urllib.request.urlopen(f"http://127.0.0.1:{port}/manifest.json?token={tok}", timeout=5).read().decode("utf-8")
+            lambda: urllib.request.urlopen(f"http://127.0.0.1:{port}/manifest.json", timeout=5).read().decode("utf-8")
         )
         manifest_data = json.loads(manifest_raw)
         assert manifest_data["name"] == "反重力助手"
-        assert tok in manifest_data["start_url"]
+        assert manifest_data["start_url"] == "/"
+        assert tok not in manifest_raw
 
-        # 2. Connect via Cookie (no query token) to verify iOS standalone PWA auth fallback
+        # 2. Connect via HttpOnly signed session cookie (no query token)
         async with websockets.connect(
             f"ws://127.0.0.1:{port}/ws",
-            additional_headers={"Cookie": f"agy_pwa_token={tok}"},
+            additional_headers={"Cookie": sess_cookie_kv},
         ) as ws:
             hello = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
             assert hello["type"] == "hello"
@@ -1190,11 +1208,13 @@ async def test_security_cswsh_port_identity_codex_reconnect_and_no_double_exec(t
         await asyncio.sleep(0.2)
         assert (await asyncio.to_thread(probe_agy_gateway_identity, "127.0.0.1", port)) == "agy"
 
+        sec_sess = pwa.auth.issue_session_token(ttl_sec=3600.0)
+
         # Cookie-only GET /manifest.json MUST NOT echo secret token into `start_url`
         def _fetch_manifest_with_cookie() -> dict:
             req_m = urllib.request.Request(
                 f"http://127.0.0.1:{port}/manifest.json",
-                headers={"Cookie": f"agy_pwa_token={tok}"},
+                headers={"Cookie": f"agy_session={sec_sess}"},
             )
             with urllib.request.urlopen(req_m, timeout=3) as resp_m:
                 return json.loads(resp_m.read().decode("utf-8"))
@@ -1206,11 +1226,21 @@ async def test_security_cswsh_port_identity_codex_reconnect_and_no_double_exec(t
         async with websockets.connect(
             f"ws://127.0.0.1:{port}/ws",
             origin="https://evil.example",
-            additional_headers={"Cookie": f"agy_pwa_token={tok}"},
+            additional_headers={"Cookie": f"agy_session={sec_sess}"},
         ) as ws_evil:
             with pytest.raises(websockets.exceptions.ConnectionClosed) as exc_info:
                 await asyncio.wait_for(ws_evil.recv(), timeout=3.0)
             assert exc_info.value.rcvd is not None and exc_info.value.rcvd.code == 4003
+
+        # Legacy raw-token cookies (`agy_pwa_token` / master token in `agy_session`) MUST be rejected with 4001!
+        for bad_cookie in (f"agy_pwa_token={tok}", f"agy_session={tok}"):
+            async with websockets.connect(
+                f"ws://127.0.0.1:{port}/ws",
+                additional_headers={"Cookie": bad_cookie},
+            ) as ws_legacy:
+                with pytest.raises(websockets.exceptions.ConnectionClosed) as exc_leg:
+                    await asyncio.wait_for(ws_legacy.recv(), timeout=3.0)
+                assert exc_leg.value.rcvd is not None and exc_leg.value.rcvd.code == 4001
 
         # Aborted upload MUST NOT leave `.part` or partial files behind on disconnect
         from qq_agy_bridge.desktop_tools import PROJECT_INBOX_DIR
@@ -1348,7 +1378,13 @@ async def test_ergonomic_and_expert_upgrades_e2e(tmp_path: Path) -> None:
         return (True, f"已执行 {act}")
 
     tok = "ergonomic-upgrade-tok-777"
-    cfg = _make_config(tmp_path, web_pwa_port=port, web_access_token=tok)
+    cfg = _make_config(
+        tmp_path,
+        web_pwa_port=port,
+        web_access_token=tok,
+        remote_desktop_enabled=True,
+        remote_clipboard_enabled=True,
+    )
     sessions = SessionManager(cfg, command_override=[sys.executable, str(MOCK_AGY)])
     pwa = WebPwaServer(
         cfg,
@@ -2172,7 +2208,9 @@ async def test_nav_seq_prevents_stale_select_overwrite_and_slash_new_preserves_s
 
 
 @pytest.mark.asyncio
-async def test_precision_remote_desktop_loupe_trackpad_hotkey_and_type_text(tmp_path: Path) -> None:
+async def test_precision_remote_desktop_loupe_trackpad_hotkey_and_type_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Verify Phase 2 Precision Remote Desktop upgrades:
     1. `perform_desktop_remote_input` validates whitelisted `hotkey`, `type_text`, `move`, and rejects unsafe combos/lengths.
     2. `capture_desktop_fast_jpeg_sync` writes into `inbox/previews` without pruning user uploads in `inbox/`.
@@ -2212,10 +2250,27 @@ async def test_precision_remote_desktop_loupe_trackpad_hotkey_and_type_text(tmp_
 
     # Ensure `capture_desktop_fast_jpeg_sync` isolates preview frames in `previews/` and NEVER deletes user uploads!
     if sys.platform == "win32":
+        import qq_agy_bridge.desktop_tools as _dt
+
+        if os.environ.get("RUN_LIVE_DESKTOP_CAPTURE_TEST") != "1":
+            def _fake_fast_cap(dest: Path, max_width: int = 1600, quality: int = 80) -> bool:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01" + (b"\xaa" * 600) + b"\xff\xd9")
+                return True
+
+            monkeypatch.setattr(_dt, "_capture_desktop_gdiplus_fast", _fake_fast_cap)
+            monkeypatch.setattr(
+                _dt.subprocess,
+                "run",
+                lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("unexpected real screen capture")),
+            )
+
         user_upload = tmp_path / "pwa_important_upload.png"
         user_upload.write_bytes(b"\x89PNG\r\n\x1a\n" + b"U" * 64)
         shot_p = capture_desktop_fast_jpeg_sync(tmp_path, max_width=800, quality=72)
         assert shot_p.is_file() and shot_p.stat().st_size > 500
+        shot_bytes = shot_p.read_bytes()
+        assert shot_bytes.startswith(b"\xff\xd8") and shot_bytes.endswith(b"\xff\xd9")
         assert shot_p.parent.name == "previews"
         assert user_upload.is_file()
 
@@ -2231,7 +2286,13 @@ async def test_precision_remote_desktop_loupe_trackpad_hotkey_and_type_text(tmp_
         port = s.getsockname()[1]
 
     tok = "precision-desk-token-2026"
-    cfg = _make_config(tmp_path, web_pwa_port=port, web_access_token=tok)
+    cfg = _make_config(
+        tmp_path,
+        web_pwa_port=port,
+        web_access_token=tok,
+        remote_desktop_enabled=True,
+        remote_clipboard_enabled=True,
+    )
     sessions = SessionManager(cfg, command_override=[sys.executable, str(MOCK_AGY)])
     pwa = WebPwaServer(
         cfg,

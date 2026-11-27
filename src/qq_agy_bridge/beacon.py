@@ -25,6 +25,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -33,8 +34,14 @@ PBKDF2_ITERATIONS = 100_000
 BEACON_DOMAIN_TAG = b"AGY-BEACON-V1"
 _BEACON_PUBLISH_LOCK = threading.Lock()
 
+# Protect upstream project repositories against accidental force-push from cloned forks without explicit configuration
+PROTECTED_UPSTREAM_REPOS = frozenset(
+    {"wwd177/antigravity-remote-assistant", "wwd177/stayy"}
+)
+
 GITHUB_REMOTE_RE = re.compile(
-    r"github\.com[:/](?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+?)(?:\.git)?/?$"
+    r"^(?:https?://(?:www\.)?github\.com/|ssh://git@github\.com/|git@github\.com:)"
+    r"(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+?)(?:\.git)?/?$"
 )
 
 
@@ -124,13 +131,38 @@ def decrypt_beacon_payload(
     return parsed
 
 
-def detect_github_pages_info(project_dir: Path) -> tuple[str, str, str, str] | None:
-    """Return `(remote_url, owner, repo, pages_url)` from `git remote get-url origin`, or None."""
+_FORBIDDEN_BEACON_BRANCHES = frozenset(
+    {"main", "master", "trunk", "develop", "dev", "head", "prod", "production", "release"}
+)
+
+
+def _normalize_safe_beacon_branch(branch: str) -> str | None:
+    cand = (branch or "").strip()
+    if not cand or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in cand):
+        return None
+    if cand.lower().startswith("refs/heads/"):
+        cand = cand[len("refs/heads/"):]
+    elif cand.lower().startswith("refs/"):
+        return None
+    if not cand or cand.startswith(("-", "/")) or cand.endswith(("/", ".", ".lock")):
+        return None
+    if ".." in cand or "@{" in cand or "\\" in cand or "//" in cand:
+        return None
+    for bad in ("~", "^", ":", "?", "*", "["):
+        if bad in cand:
+            return None
+    if cand.lower() in _FORBIDDEN_BEACON_BRANCHES:
+        return None
+    return cand
+
+
+def _apply_git_push_rewrites(project_dir: Path, raw_url: str) -> str:
     extra = {"creationflags": CREATE_NO_WINDOW} if sys.platform == "win32" else {}
+    cwd_target = str(project_dir) if project_dir.is_dir() else None
     try:
         res = subprocess.run(
-            ["git", "remote", "get-url", "origin"],
-            cwd=str(project_dir),
+            ["git", "config", "--get-regexp", r"^url\..*\.(pushinsteadof|insteadof)$"],
+            cwd=cwd_target,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -138,18 +170,132 @@ def detect_github_pages_info(project_dir: Path) -> tuple[str, str, str, str] | N
             timeout=4,
             **extra,
         )
-        if res.returncode != 0:
-            return None
-        remote_url = (res.stdout or "").strip()
-        m = GITHUB_REMOTE_RE.search(remote_url)
-        if not m:
-            return None
-        owner = m.group("owner")
-        repo = m.group("repo")
-        pages_url = f"https://{owner.lower()}.github.io/{repo}/"
-        return (remote_url, owner, repo, pages_url)
+        if res.returncode != 0 or not res.stdout:
+            return raw_url
     except Exception:
+        return raw_url
+
+    best_push: tuple[int, str, str] | None = None
+    best_any: tuple[int, str, str] | None = None
+    for raw_ln in res.stdout.splitlines():
+        ln = raw_ln.strip()
+        if not ln or " " not in ln:
+            continue
+        key, _, prefix = ln.partition(" ")
+        prefix = prefix.strip()
+        if not prefix or not raw_url.startswith(prefix):
+            continue
+        k_low = key.lower()
+        if k_low.startswith("url.") and k_low.endswith(".pushinsteadof"):
+            repl = key[4 : -len(".pushinsteadof")]
+            if repl and (best_push is None or len(prefix) > best_push[0]):
+                best_push = (len(prefix), prefix, repl)
+        elif k_low.startswith("url.") and k_low.endswith(".insteadof"):
+            repl = key[4 : -len(".insteadof")]
+            if repl and (best_any is None or len(prefix) > best_any[0]):
+                best_any = (len(prefix), prefix, repl)
+    chosen = best_push or best_any
+    if chosen is not None:
+        _, pref, repl = chosen
+        return repl + raw_url[len(pref):]
+    return raw_url
+
+
+def resolve_explicit_beacon_target(
+    project_dir: Path,
+    *,
+    beacon_enabled: bool,
+    explicit_remote: str,
+    allow_upstream_protected: bool = False,
+) -> tuple[str, str, str, str] | None:
+    """Resolve explicit user-owned GitHub Pages beacon target.
+
+    NEVER infers `origin` implicitly when `beacon_enabled` is False or `explicit_remote` is blank.
+    Always inspects git push URL (`--push`), rejects inline credentials and protected upstream repos.
+    Returns `(remote_url, owner, repo, pages_url)` or None.
+    """
+    if not beacon_enabled:
         return None
+    clean_remote = (explicit_remote or "").strip()
+    if not clean_remote:
+        return None
+
+    remote_url = ""
+    is_literal_url = False
+    if clean_remote.startswith(("https://", "http://", "git@", "ssh://", "file://")) or Path(clean_remote).exists():
+        remote_url = clean_remote
+        is_literal_url = True
+    else:
+        extra = {"creationflags": CREATE_NO_WINDOW} if sys.platform == "win32" else {}
+        try:
+            res = subprocess.run(
+                ["git", "remote", "get-url", "--push", "--all", clean_remote],
+                cwd=str(project_dir),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=4,
+                **extra,
+            )
+            if res.returncode != 0 or not (res.stdout or "").strip():
+                logger.warning("Refusing beacon remote without verifiable push URL: %s", clean_remote)
+                return None
+            lines_out = [ln.strip() for ln in (res.stdout or "").splitlines() if ln.strip()]
+            if len(lines_out) == 1:
+                remote_url = lines_out[0]
+            elif len(lines_out) > 1:
+                logger.warning("Refusing ambiguous multi-pushurl git remote %s", clean_remote)
+                return None
+        except Exception:
+            return None
+
+    if not remote_url:
+        return None
+    if is_literal_url:
+        remote_url = _apply_git_push_rewrites(project_dir, remote_url)
+
+    try:
+        if remote_url.startswith(("http://", "https://")):
+            parsed = urlsplit(remote_url)
+            if parsed.username or parsed.password or parsed.query or parsed.fragment:
+                logger.warning("Refusing beacon URL containing inline credentials or query/fragment")
+                return None
+        elif remote_url.startswith("ssh://"):
+            parsed = urlsplit(remote_url)
+            if parsed.password or (parsed.username and parsed.username != "git"):
+                logger.warning("Refusing ssh beacon URL with non-standard credentials")
+                return None
+    except ValueError:
+        logger.warning("Refusing malformed beacon URL")
+        return None
+
+    m = GITHUB_REMOTE_RE.match(remote_url)
+    if not m:
+        return None
+    owner = m.group("owner")
+    repo = m.group("repo")
+    slug = f"{owner}/{repo}".lower()
+    if slug in PROTECTED_UPSTREAM_REPOS and not allow_upstream_protected:
+        logger.warning("Refusing to publish beacon onto protected upstream repo %s", slug)
+        return None
+    pages_url = f"https://{owner.lower()}.github.io/{repo}/"
+    return (remote_url, owner, repo, pages_url)
+
+
+def detect_candidate_beacon_remote(project_dir: Path) -> tuple[str, str, str, str] | None:
+    """Inspect git `origin` push URL as a candidate target while blocking protected upstream repos."""
+    return resolve_explicit_beacon_target(
+        project_dir,
+        beacon_enabled=True,
+        explicit_remote="origin",
+        allow_upstream_protected=False,
+    )
+
+
+def detect_github_pages_info(project_dir: Path) -> tuple[str, str, str, str] | None:
+    """Return `(remote_url, owner, repo, pages_url)` for safe user-owned remote, blocking upstream repos."""
+    return detect_candidate_beacon_remote(project_dir)
 
 
 STATIC_PWA_SW_JS = """\
@@ -322,15 +468,27 @@ def publish_ios_pwa_and_beacon(
     access_token: str,
     tunnel_url: str,
     lan_url: str,
+    beacon_enabled: bool = False,
+    explicit_remote: str = "",
+    allow_upstream_protected: bool = False,
+    beacon_branch: str = "gh-pages",
 ) -> tuple[bool, str]:
     """Build and force-push single-commit `gh-pages` branch with encrypted `beacon.json`.
 
-    Never touches the `main` working directory or git index.
+    Never touches the `main` working directory or git index, and refuses protected upstream repos.
     Returns `(ok, pages_url_or_error)`.
     """
-    gh_info = detect_github_pages_info(project_dir)
+    target_branch = _normalize_safe_beacon_branch(beacon_branch)
+    if not target_branch:
+        return (False, "拒绝将信标强推至受保护源码分支、标签或非法分支名")
+    gh_info = resolve_explicit_beacon_target(
+        project_dir,
+        beacon_enabled=beacon_enabled,
+        explicit_remote=explicit_remote,
+        allow_upstream_protected=allow_upstream_protected,
+    )
     if gh_info is None:
-        return (False, "未检测到 GitHub origin 远程仓库")
+        return (False, "未启用自有仓库加密信标或目标仓库不受支持（已拦截受保护上游仓库）")
     remote_url, owner, repo, pages_url = gh_info
 
     stage_dir = project_dir / ".gh_pages_stage"
@@ -365,11 +523,23 @@ def publish_ios_pwa_and_beacon(
                     **extra,
                 )
 
-            init_res = _git("init", "-b", "gh-pages")
+            init_res = _git("init", "-b", target_branch)
             if init_res.returncode != 0:
                 return (False, f"初始化信标仓库失败：{(init_res.stderr or init_res.stdout).strip()[:120]}")
             _git("config", "user.name", "Antigravity Beacon")
             _git("config", "user.email", "beacon@antigravity.local")
+            _git("remote", "add", "_beacon_target", remote_url)
+            re_checked = resolve_explicit_beacon_target(
+                stage_dir,
+                beacon_enabled=True,
+                explicit_remote="_beacon_target",
+                allow_upstream_protected=allow_upstream_protected,
+            )
+            if (
+                re_checked is None
+                or (re_checked[1].lower(), re_checked[2].lower()) != (owner.lower(), repo.lower())
+            ):
+                return (False, "最终 Git push 目标校验未通过（已拦截受保护上游或 rewrite 规则）")
             add_res = _git(
                 "add",
                 "--",
@@ -389,9 +559,9 @@ def publish_ios_pwa_and_beacon(
             if c_res.returncode != 0:
                 return (False, f"生成信标提交失败：{(c_res.stderr or c_res.stdout).strip()[:120]}")
 
-            p_res = _git("push", "-f", remote_url, "HEAD:gh-pages", timeout=30)
+            p_res = _git("push", "-f", "_beacon_target", f"HEAD:refs/heads/{target_branch}", timeout=30)
             if p_res.returncode != 0:
-                return (False, f"推送 gh-pages 失败：{(p_res.stderr or p_res.stdout).strip()[:140]}")
+                return (False, f"推送 {target_branch} 失败：{(p_res.stderr or p_res.stdout).strip()[:140]}")
 
             return (True, pages_url)
         except Exception as exc:

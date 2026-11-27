@@ -235,7 +235,7 @@ def run_doctor(project_dir: Path = PROJECT_ROOT) -> dict[str, Any]:
             cfg_ok = cfg.web_pwa_enabled and bool(cfg.web_access_token)
             lan_ip = get_lan_ipv4()
             if cfg_ok:
-                pwa_lan_url = f"http://{lan_ip}:{cfg.web_pwa_port}/?token={cfg.web_access_token}"
+                pwa_lan_url = f"http://{lan_ip}:{cfg.web_pwa_port}/"
         except Exception:
             cfg_ok = False
 
@@ -254,7 +254,7 @@ def run_doctor(project_dir: Path = PROJECT_ROOT) -> dict[str, Any]:
             "name": "cloudflare_tunnel_optional",
             "ok": True,
             "installed": bool(cf_path),
-            "detail": cf_path if cf_path else "未安装（同 Wi-Fi 局域网 1ms 扫码不受影响）",
+            "detail": cf_path if cf_path else "未安装（同 Wi-Fi 局域网低延迟扫码不受影响）",
         }
     )
 

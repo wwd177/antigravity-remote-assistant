@@ -2,7 +2,7 @@
 
 Features:
 - Pure standalone Antigravity + Codex remote control hub (zero QQ / NapCat dependencies)
-- Inline Frosted Glass QR Pairing Hero (1-click switch between 1ms Wi-Fi LAN & 4G/5G Cloudflare Tunnel)
+- Inline Frosted Glass QR Pairing Hero (1-click switch between low-latency Wi-Fi LAN & 4G/5G Cloudflare Tunnel)
 - Live PC conversation telemetry (Antigravity IDE + Codex Desktop synced chat counts)
 - Native Windows 11 DWM immersive dark chrome, rounded corners, and smooth layered translucency
 - Auto-healing service watchdog, sleep-prevention toggle, and one-click Firewall UAC helper
@@ -35,11 +35,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from tkinter import messagebox, ttk
-from typing import Callable
+from typing import Any, Callable
 
 from dotenv import dotenv_values
 
-from .beacon import detect_github_pages_info, publish_ios_pwa_and_beacon
+from .auth import atomic_update_env_vars
+from .beacon import publish_ios_pwa_and_beacon, resolve_explicit_beacon_target
 from .conversations import list_local_conversations
 from .maintenance import discover_default_cache_targets, run_safe_cache_cleanup
 from .web_pwa import ensure_web_access_token, get_lan_ipv4
@@ -49,6 +50,7 @@ LEGACY_TITLES = ("QQ Antigravity 机器人", "Antigravity 远程助理")
 MUTEX_NAME = "Local\\AntigravityAssistantLauncherSingleton"
 
 PROJECT_DIR = Path(__file__).resolve().parents[2]
+RUNTIME_DIR = PROJECT_DIR / ".runtime"
 ICON_PATH = PROJECT_DIR / "assets" / "app.ico"
 UI_PREFS_PATH = PROJECT_DIR / ".launcher_ui.json"
 STARTUP_SHORTCUT_NAME = "反重力助手.lnk"
@@ -338,6 +340,12 @@ class LauncherSettings:
     web_access_token: str
     tunnel_enabled: bool
     project_dir: Path
+    remote_desktop_enabled: bool = False
+    remote_clipboard_enabled: bool = False
+    beacon_enabled: bool = False
+    beacon_git_remote: str = ""
+    beacon_branch: str = "gh-pages"
+    public_base_url: str = ""
 
 
 def _bool_env(val: object, default: bool = True) -> bool:
@@ -356,6 +364,12 @@ def load_settings() -> LauncherSettings:
     raw_web_tok = str(env_data.get("WEB_ACCESS_TOKEN") or "").strip()
     web_tok = ensure_web_access_token(env_file, raw_web_tok) if web_pwa_enabled else raw_web_tok
     tunnel_enabled = _bool_env(env_data.get("CLOUDFLARE_TUNNEL_ENABLED"), True)
+    remote_desktop_enabled = _bool_env(env_data.get("REMOTE_DESKTOP_ENABLED"), False)
+    remote_clipboard_enabled = _bool_env(env_data.get("REMOTE_CLIPBOARD_ENABLED"), False)
+    beacon_enabled = _bool_env(env_data.get("BEACON_ENABLED"), False)
+    beacon_git_remote = str(env_data.get("BEACON_GIT_REMOTE") or "").strip()
+    beacon_branch = str(env_data.get("BEACON_BRANCH") or "gh-pages").strip() or "gh-pages"
+    public_base_url = str(env_data.get("PUBLIC_BASE_URL") or "").strip().rstrip("/")
 
     return LauncherSettings(
         active_model=active_model,
@@ -365,6 +379,12 @@ def load_settings() -> LauncherSettings:
         web_access_token=web_tok,
         tunnel_enabled=tunnel_enabled,
         project_dir=PROJECT_DIR,
+        remote_desktop_enabled=remote_desktop_enabled,
+        remote_clipboard_enabled=remote_clipboard_enabled,
+        beacon_enabled=beacon_enabled,
+        beacon_git_remote=beacon_git_remote,
+        beacon_branch=beacon_branch,
+        public_base_url=public_base_url,
     )
 
 
@@ -676,10 +696,22 @@ class LauncherApp:
         self._busy = False
         self._closing = False
 
-        gh_info = detect_github_pages_info(settings.project_dir)
+        gh_info = (
+            resolve_explicit_beacon_target(
+                settings.project_dir,
+                beacon_enabled=settings.beacon_enabled,
+                explicit_remote=settings.beacon_git_remote,
+            )
+            if settings.beacon_enabled
+            else None
+        )
         self._ios_pages_url: str = gh_info[3] if gh_info else ""
         self._beacon_synced: bool = False
-        self._qr_mode = tk.StringVar(value="ios" if self._ios_pages_url else "lan")
+        self._active_pair_code: str = ""
+        self._active_pair_issued_mono: float = 0.0
+        self._qr_mode = tk.StringVar(
+            value="tunnel" if (settings.public_base_url or settings.tunnel_enabled) else "lan"
+        )
         self._qr_photo_ref: list[tk.PhotoImage] = []
         self._conv_stats_str = "正在扫描电脑端会话..."
 
@@ -690,6 +722,8 @@ class LauncherApp:
         self._show_debug_var = tk.BooleanVar(value=False)
         self._autostart_var = tk.BooleanVar(value=is_autostart_enabled())
         self._keep_awake_var = tk.BooleanVar(value=bool(self._prefs.get("keep_awake", True)))
+        self._remote_desktop_var = tk.BooleanVar(value=settings.remote_desktop_enabled)
+        self._remote_clipboard_var = tk.BooleanVar(value=settings.remote_clipboard_enabled)
 
         self._img_cache: dict[tuple, tk.PhotoImage] = {}
         self._orbs: dict[str, tk.PhotoImage] = {}
@@ -844,7 +878,7 @@ class LauncherApp:
 
         self.subtitle_lbl = tk.Label(
             left_hdr,
-            text="Antigravity + Codex 全会话同步   ·   Wi-Fi 1ms 直连 + 4G/5G 全球加密隧道",
+            text="Antigravity + Codex 全会话同步   ·   Wi-Fi 局域网直连 + 4G/5G 全球加密隧道",
             bg=self.BG,
             fg=self.TEXT_MUTED,
             font=("Microsoft YaHei UI", 9),
@@ -927,6 +961,41 @@ class LauncherApp:
             cursor="hand2",
         ).pack(side=tk.LEFT)
 
+        cap_row = tk.Frame(right_hdr, bg=self.BG)
+        cap_row.pack(side=tk.TOP, anchor="e", pady=(4, 0))
+
+        tk.Checkbutton(
+            cap_row,
+            text="允许远程桌面触控",
+            variable=self._remote_desktop_var,
+            command=self._on_toggle_remote_desktop,
+            bg=self.BG,
+            fg=self.TEXT_SECONDARY,
+            selectcolor="#101B2D",
+            activebackground=self.BG,
+            activeforeground=self.TEXT_PRIMARY,
+            font=("Microsoft YaHei UI", 8),
+            bd=0,
+            highlightthickness=0,
+            cursor="hand2",
+        ).pack(side=tk.LEFT, padx=(0, 12))
+
+        tk.Checkbutton(
+            cap_row,
+            text="允许远程剪贴板",
+            variable=self._remote_clipboard_var,
+            command=self._on_toggle_remote_clipboard,
+            bg=self.BG,
+            fg=self.TEXT_SECONDARY,
+            selectcolor="#101B2D",
+            activebackground=self.BG,
+            activeforeground=self.TEXT_PRIMARY,
+            font=("Microsoft YaHei UI", 8),
+            bd=0,
+            highlightthickness=0,
+            cursor="hand2",
+        ).pack(side=tk.LEFT)
+
         # ── Two-Column Hero Dashboard (Telemetry + Inline Live QR Card) ──
         hero_grid = tk.Frame(outer, bg=self.BG)
         hero_grid.pack(fill=tk.X, pady=(0, 12))
@@ -965,18 +1034,18 @@ class LauncherApp:
             hover=self.PILL_PRIMARY_HOVER,
             padx=12,
         )
-        self.btn_start.pack(side=tk.LEFT, padx=(0, 6))
+        self.btn_start.pack(side=tk.LEFT, padx=(0, 5))
 
         self.btn_restart = self._make_button(
             self.btn_bar,
-            text="↻ 重启接管",
+            text="↻ 重启",
             command=lambda: self._run_async(self._start_all_worker, True),
             bg=self.PILL_SLATE,
             hover=self.PILL_SLATE_HOVER,
             highlight="#383838",
-            padx=11,
+            padx=10,
         )
-        self.btn_restart.pack(side=tk.LEFT, padx=(0, 6))
+        self.btn_restart.pack(side=tk.LEFT, padx=(0, 5))
 
         self.btn_stop = self._make_button(
             self.btn_bar,
@@ -984,20 +1053,31 @@ class LauncherApp:
             command=lambda: self._run_async(self._stop_all_worker, True),
             bg=self.PILL_DANGER,
             hover=self.PILL_DANGER_HOVER,
-            padx=11,
+            padx=10,
         )
-        self.btn_stop.pack(side=tk.LEFT, padx=(0, 8))
+        self.btn_stop.pack(side=tk.LEFT, padx=(0, 5))
+
+        self.btn_revoke = self._make_button(
+            self.btn_bar,
+            text="🔒 撤销",
+            command=lambda: self._run_async(self._revoke_tokens_worker),
+            bg="#3B1D24",
+            hover="#7F1D1D",
+            highlight="#7F1D1D",
+            padx=10,
+        )
+        self.btn_revoke.pack(side=tk.LEFT, padx=(0, 6))
 
         self.btn_open_web = self._make_button(
             self.btn_bar,
-            text="🖥 网页端",
+            text="🖥 网页",
             command=self._open_local_browser,
             bg="#ECECEC",
             hover="#FFFFFF",
             fg="#0D0D0D",
-            padx=11,
+            padx=10,
         )
-        self.btn_open_web.pack(side=tk.LEFT, padx=(0, 6))
+        self.btn_open_web.pack(side=tk.LEFT, padx=(0, 5))
 
         self.btn_folder = self._make_button(
             self.btn_bar,
@@ -1006,9 +1086,9 @@ class LauncherApp:
             bg=self.PILL_SLATE,
             hover=self.PILL_SLATE_HOVER,
             highlight="#383838",
-            padx=10,
+            padx=9,
         )
-        self.btn_folder.pack(side=tk.LEFT, padx=(0, 6))
+        self.btn_folder.pack(side=tk.LEFT, padx=(0, 5))
 
         self.btn_clean = self._make_button(
             self.btn_bar,
@@ -1017,7 +1097,7 @@ class LauncherApp:
             bg=self.PILL_SLATE,
             hover=self.PILL_SLATE_HOVER,
             highlight="#383838",
-            padx=10,
+            padx=9,
         )
         self.btn_clean.pack(side=tk.LEFT)
 
@@ -1037,7 +1117,7 @@ class LauncherApp:
         qr_hdr.pack(fill=tk.X)
         tk.Label(
             qr_hdr,
-            text="扫码直连",
+            text="扫码配对",
             bg=self.QR_SURFACE,
             fg=self.TEXT_PRIMARY,
             font=("Microsoft YaHei UI", 10, "bold"),
@@ -1078,8 +1158,7 @@ class LauncherApp:
         )
         self.qr_tab_tunnel.pack(side=tk.RIGHT, padx=(3, 0))
         self.qr_tab_lan.pack(side=tk.RIGHT, padx=(3, 0))
-        if self._ios_pages_url:
-            self.qr_tab_ios.pack(side=tk.RIGHT)
+        self.qr_tab_ios.pack(side=tk.RIGHT)
 
         self.qr_img_lbl = tk.Label(
             qr_card,
@@ -1105,11 +1184,22 @@ class LauncherApp:
 
         self._make_button(
             qr_actions,
-            text="复制免密链接",
+            text="复制配对链接",
             command=self._copy_qr_link,
             bg="#2F2F2F",
             hover="#3D3D3D",
-            padx=11,
+            padx=10,
+            pady=4,
+            font_size=8,
+        ).pack(side=tk.LEFT, padx=3)
+
+        self._make_button(
+            qr_actions,
+            text="🔄 刷码",
+            command=lambda: threading.Thread(target=self._refresh_pair_code_worker, daemon=True).start(),
+            bg="#2F2F2F",
+            hover="#3D3D3D",
+            padx=8,
             pady=4,
             font_size=8,
         ).pack(side=tk.LEFT, padx=3)
@@ -1345,15 +1435,100 @@ class LauncherApp:
         btn.bind("<Leave>", lambda _e: btn.configure(bg=btn._base_bg))  # type: ignore[attr-defined]
         return btn
 
+    def _read_admin_state(self) -> dict[str, Any] | None:
+        adm_file = RUNTIME_DIR / "admin.json"
+        if not adm_file.is_file():
+            return None
+        try:
+            data = json.loads(adm_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and data.get("port") and data.get("admin_token"):
+                return data
+        except Exception:
+            pass
+        return None
+
+    def _admin_request(
+        self,
+        method: str,
+        path: str,
+        timeout: float = 2.0,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        st = self._read_admin_state()
+        if not st:
+            return None
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        headers = {"X-Admin-Token": str(st["admin_token"])}
+        body_bytes: bytes | None = None
+        if payload is not None:
+            body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            headers["Content-Type"] = "application/json; charset=utf-8"
+        elif method.upper() == "POST":
+            body_bytes = b"{}"
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{int(st['port'])}{path}",
+            method=method.upper(),
+            data=body_bytes,
+            headers=headers,
+        )
+        try:
+            with opener.open(req, timeout=timeout) as resp:
+                return json.loads(resp.read(16384).decode("utf-8", errors="replace"))
+        except Exception:
+            return None
+
+    def _refresh_pair_code_worker(self) -> None:
+        res = self._admin_request("POST", "/admin/pair")
+        if res and res.get("ok") and res.get("code"):
+            self._active_pair_code = str(res["code"])
+            self._active_pair_issued_mono = time.monotonic()
+            self._post_ui(self._render_inline_qr)
+
+    def _revoke_tokens_worker(self) -> None:
+        self._enqueue_log("安全", "正在轮换访问密钥并强制断开所有已配对设备...", "warn")
+        res = self._admin_request("POST", "/admin/revoke", timeout=4.0)
+        if not res or not res.get("ok"):
+            self._enqueue_log("安全", "撤销失败：反重力网关未就绪或写入 .env 失败。", "err")
+            return
+        self.settings = load_settings()
+        closed_n = int(res.get("closed_clients") or 0)
+        new_ep = int(res.get("auth_epoch") or 0)
+        self._active_pair_code = ""
+        self._beacon_synced = False
+        pair_res = self._admin_request("POST", "/admin/pair")
+        if pair_res and pair_res.get("ok") and pair_res.get("code"):
+            self._active_pair_code = str(pair_res["code"])
+            self._active_pair_issued_mono = time.monotonic()
+        self._post_ui(self._render_inline_qr)
+        self._enqueue_log(
+            "安全",
+            f"✓ 已轮换密钥至第 {new_ep} 代并断开 {closed_n} 台在线设备，旧会话已全部失效。",
+            "tunnel",
+        )
+        if self._ios_pages_url and self.settings.beacon_enabled:
+            sync_url = self.settings.public_base_url or self._tunnel_url or f"http://{get_lan_ipv4()}:{self.settings.web_pwa_port}"
+            threading.Thread(
+                target=self._sync_ios_beacon_worker,
+                args=(sync_url, self._tunnel_gen),
+                daemon=True,
+            ).start()
+
     def _current_qr_url(self) -> str:
         tok = self.settings.web_access_token
         mode = self._qr_mode.get()
-        if mode == "ios" and self._ios_pages_url:
-            return f"{self._ios_pages_url}?key={tok}"
+        pair = self._active_pair_code
+        frag_suffix = f"#pair={pair}" if pair else ""
+        if mode == "ios":
+            if self.settings.public_base_url:
+                return f"{self.settings.public_base_url.rstrip('/')}/{frag_suffix}" if frag_suffix else ""
+            if self.settings.beacon_enabled and self._ios_pages_url and self._beacon_synced:
+                return f"{self._ios_pages_url}#key={tok}"
+            return ""
         if mode == "tunnel":
-            return f"{self._tunnel_url}/?token={tok}" if self._tunnel_url else ""
+            base = self.settings.public_base_url or self._tunnel_url
+            return f"{base.rstrip('/')}/{frag_suffix}" if (base and frag_suffix) else ""
         lan_ip = get_lan_ipv4()
-        return f"http://{lan_ip}:{self.settings.web_pwa_port}/?token={tok}"
+        return f"http://{lan_ip}:{self.settings.web_pwa_port}/{frag_suffix}" if frag_suffix else ""
 
     def _switch_qr_mode(self, mode: str) -> None:
         self._qr_mode.set(mode)
@@ -1375,11 +1550,38 @@ class LauncherApp:
 
         target_u = self._current_qr_url()
         if not target_u:
-            self.qr_img_lbl.configure(
-                image="",
-                text="\n正在建立全球加密隧道...\n约 3~6 秒自动生成外网二维码\n（同 Wi-Fi 可点 Wi-Fi 秒扫）\n",
-            )
-            self.qr_url_lbl.configure(text="等待分配 https://*.trycloudflare.com")
+            if m == "ios":
+                if not self.settings.beacon_enabled:
+                    msg = (
+                        "\n永久 App 信标默认关闭 (BEACON_ENABLED=false)\n"
+                        "如需重启免重扫：Fork 本仓库到你名下，\n"
+                        "并在 .env 设置 BEACON_ENABLED=true\n"
+                        "与 BEACON_GIT_REMOTE=<你的仓库HTTPS>\n"
+                    )
+                    lbl = "请用「Wi-Fi」/「外网」配对，或先 Fork 开启信标"
+                else:
+                    msg = "\n正在向自有仓库同步并验真 iOS 永久信标...\n（未验真前不显示永久二维码）\n"
+                    lbl = "等待加密信标验真..."
+                self.qr_img_lbl.configure(image="", text=msg)
+                self.qr_url_lbl.configure(text=lbl)
+            elif m == "lan":
+                self.qr_img_lbl.configure(
+                    image="",
+                    text="\n正在向本机网关申请一次性配对码...\n请稍候 1~3 秒，或点击下方「刷码」\n",
+                )
+                self.qr_url_lbl.configure(text="等待一次性配对码")
+            elif self.settings.public_base_url or self._tunnel_url:
+                self.qr_img_lbl.configure(
+                    image="",
+                    text="\n外网入口已就绪，正在生成一次性配对码...\n请稍候 1~3 秒，或点击下方「刷码」\n",
+                )
+                self.qr_url_lbl.configure(text="等待一次性配对码")
+            else:
+                self.qr_img_lbl.configure(
+                    image="",
+                    text="\n正在建立全球加密隧道...\n约 3~6 秒自动生成外网配对二维码\n（同 Wi-Fi 可点 Wi-Fi 秒扫）\n",
+                )
+                self.qr_url_lbl.configure(text="等待分配 https://*.trycloudflare.com")
             return
 
         try:
@@ -1394,27 +1596,59 @@ class LauncherApp:
             self._qr_photo_ref.append(photo)
             self.qr_img_lbl.configure(image=photo, text="")
             if m == "ios":
-                note = "iPhone 扫码 → 分享 → 添加到主屏幕 (永久有效)"
-                if not self._beacon_synced:
-                    note = "正在同步加密信标，稍候即可永久免重扫..."
-                self.qr_url_lbl.configure(text=note)
+                self.qr_url_lbl.configure(
+                    text=(
+                        "iPhone 扫码 → 分享 → 添加到主屏幕 (已验真)"
+                        if self._beacon_synced
+                        else "固定公网入口 (一次性配对码)"
+                    )
+                )
+            elif m == "lan":
+                masked = target_u.split("#")[0].split("?")[0]
+                self.qr_url_lbl.configure(text=f"仅限可信内网 · {masked} (一次性配对码)")
             else:
-                masked = target_u.split("?token=")[0]
-                self.qr_url_lbl.configure(text=masked)
+                masked = target_u.split("#")[0].split("?")[0]
+                self.qr_url_lbl.configure(text=f"{masked} (一次性配对码)")
         except Exception as exc:
             self.qr_img_lbl.configure(image="", text=f"二维码渲染失败：{exc}")
 
     def _copy_qr_link(self) -> None:
-        lan_ip = get_lan_ipv4()
-        fallback = f"http://{lan_ip}:{self.settings.web_pwa_port}/?token={self.settings.web_access_token}"
-        u = self._current_qr_url() or fallback
-        self.root.clipboard_clear()
-        self.root.clipboard_append(u)
-        self.qr_url_lbl.configure(text="✓ 已复制免密直连链接！")
+        self.qr_url_lbl.configure(text="正在生成一次性配对链接...")
+
+        def _worker() -> None:
+            res = self._admin_request("POST", "/admin/pair")
+            new_code = str(res["code"]) if (res and res.get("ok") and res.get("code")) else ""
+
+            def _apply() -> None:
+                if self._closing:
+                    return
+                if new_code:
+                    self._active_pair_code = new_code
+                    self._active_pair_issued_mono = time.monotonic()
+                u = self._current_qr_url()
+                if not u:
+                    self._render_inline_qr()
+                    self.qr_url_lbl.configure(text="⚠ 服务或通道未就绪，暂无法生成配对链接")
+                    return
+                self.root.clipboard_clear()
+                self.root.clipboard_append(u)
+                self._render_inline_qr()
+                self.qr_url_lbl.configure(text="✓ 已复制一次性配对链接！")
+
+            self._post_ui(_apply)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _open_local_browser(self) -> None:
-        url = f"http://127.0.0.1:{self.settings.web_pwa_port}/?token={self.settings.web_access_token}"
-        webbrowser.open(url)
+        def _worker() -> None:
+            res = self._admin_request("POST", "/admin/pair")
+            if res and res.get("ok") and res.get("code"):
+                url = f"http://127.0.0.1:{self.settings.web_pwa_port}/#pair={res['code']}"
+            else:
+                url = f"http://127.0.0.1:{self.settings.web_pwa_port}/"
+            self._post_ui(lambda target=url: webbrowser.open(target))
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _check_firewall_bg(self) -> None:
         ok = is_lan_firewall_rule_present(self.settings.web_pwa_port)
@@ -1463,6 +1697,30 @@ class LauncherApp:
         set_prevent_system_sleep(want and self._desired_running)
         msg = "已开启防自动休眠保活（屏幕仍可正常熄灭省电）。" if want else "已关闭防休眠保活。"
         self._enqueue_log("系统", msg, "sys")
+
+    def _apply_capability_toggle(self, env_key: str, payload_key: str, want: bool, label: str) -> None:
+        def _worker() -> None:
+            env_path = self.settings.project_dir / ".env"
+            ok_env = atomic_update_env_vars(env_path, {env_key: "true" if want else "false"})
+            self.settings = load_settings()
+            res = self._admin_request("POST", "/admin/capabilities", payload={payload_key: want})
+            state_txt = "已开启" if want else "已关闭"
+            if res and res.get("ok"):
+                self._enqueue_log("安全", f"{state_txt}「{label}」（已实时下发至在线网关）。", "sys")
+            elif ok_env:
+                self._enqueue_log("安全", f"{state_txt}「{label}」（已写入 .env，网关启动后生效）。", "sys")
+            else:
+                self._enqueue_log("安全", f"更新「{label}」配置失败（无法写入 .env）。", "err")
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_toggle_remote_desktop(self) -> None:
+        want = bool(self._remote_desktop_var.get())
+        self._apply_capability_toggle("REMOTE_DESKTOP_ENABLED", "remote_desktop", want, "远程桌面触控")
+
+    def _on_toggle_remote_clipboard(self) -> None:
+        want = bool(self._remote_clipboard_var.get())
+        self._apply_capability_toggle("REMOTE_CLIPBOARD_ENABLED", "remote_clipboard", want, "远程剪贴板读写")
 
     def _enqueue_log(self, source: str, message: str, tag: str = "sys") -> None:
         ts = datetime.now().strftime("%H:%M:%S")
@@ -1528,6 +1786,15 @@ class LauncherApp:
             return
         gw_ident = probe_agy_gateway_identity("127.0.0.1", self.settings.web_pwa_port, timeout=0.45)
         pwa_open = gw_ident == "agy"
+        if pwa_open and (
+            not self._active_pair_code
+            or (time.monotonic() - self._active_pair_issued_mono) >= 240.0
+        ):
+            res = self._admin_request("POST", "/admin/pair")
+            if res and res.get("ok") and res.get("code"):
+                self._active_pair_code = str(res["code"])
+                self._active_pair_issued_mono = time.monotonic()
+                self._post_ui(self._render_inline_qr)
         srv_alive = self._server_proc is not None and self._server_proc.poll() is None
         tun_alive = self._tunnel_proc is not None and self._tunnel_proc.poll() is None
 
@@ -1683,7 +1950,7 @@ class LauncherApp:
                     self.net_orb_lbl,
                     self.net_status_lbl,
                     "green",
-                    "双通道全通 · Wi-Fi 1ms 极速 + 全球 4G/5G 加密隧道",
+                    "双通道全通 · Wi-Fi 低延迟直连 + 全球 4G/5G 加密隧道",
                 )
                 self.net_detail_lbl.configure(
                     text=f"局域网：http://{lan_ip}:{port}   ·   外网：{self._tunnel_url}"
@@ -1703,16 +1970,16 @@ class LauncherApp:
                     self.net_orb_lbl,
                     self.net_status_lbl,
                     "green",
-                    f"Wi-Fi 1ms 已就绪 (http://{lan_ip}:{port}) · 正在分配外网隧道...",
+                    f"Wi-Fi 局域网已就绪 (http://{lan_ip}:{port}) · 正在分配外网隧道...",
                 )
             else:
                 self._set_card(
                     self.net_orb_lbl,
                     self.net_status_lbl,
                     "green",
-                    f"局域网 1ms 极速直连已就绪 · http://{lan_ip}:{port}",
+                    f"局域网低延迟直连已就绪 · http://{lan_ip}:{port}",
                 )
-                self.net_detail_lbl.configure(text=f"手机连同一 Wi-Fi 扫右侧二维码即可毫秒级操控电脑")
+                self.net_detail_lbl.configure(text=f"手机连同一 Wi-Fi 扫右侧配对二维码即可操作电脑")
         else:
             self._set_card(self.net_orb_lbl, self.net_status_lbl, "red", "网络监听未启动")
 
@@ -1724,7 +1991,7 @@ class LauncherApp:
 
     def _set_buttons_busy(self, busy: bool) -> None:
         state = tk.DISABLED if busy else tk.NORMAL
-        for btn in (self.btn_start, self.btn_restart, self.btn_stop):
+        for btn in (self.btn_start, self.btn_restart, self.btn_stop, self.btn_revoke):
             btn.configure(state=state)
 
     def _run_async(self, fn, *args) -> None:
@@ -1849,7 +2116,7 @@ class LauncherApp:
             if which_cf and Path(which_cf).is_file():
                 cf_exe = Path(which_cf)
             else:
-                self._enqueue_log("系统", "未检测到 cloudflared.exe，当前可通过同 Wi-Fi 1ms 扫码直连。", "warn")
+                self._enqueue_log("系统", "未检测到 cloudflared.exe，当前可通过同 Wi-Fi 局域网扫码配对。", "warn")
                 return
 
         self._tunnel_gen += 1
@@ -1981,6 +2248,8 @@ class LauncherApp:
                 self._enqueue_log("系统", f"{source} 进程已退出（退出码 {code}）。", "warn")
 
     def _sync_ios_beacon_worker(self, tunnel_url: str, tun_gen: int = 0) -> None:
+        if not self.settings.beacon_enabled:
+            return
         if not self._ios_pages_url or not tunnel_url or (tun_gen and tun_gen != self._tunnel_gen):
             return
         lan_url = f"http://{get_lan_ipv4()}:{self.settings.web_pwa_port}"
@@ -1989,6 +2258,9 @@ class LauncherApp:
             access_token=self.settings.web_access_token,
             tunnel_url=tunnel_url,
             lan_url=lan_url,
+            beacon_enabled=self.settings.beacon_enabled,
+            explicit_remote=self.settings.beacon_git_remote,
+            beacon_branch=self.settings.beacon_branch,
         )
         if tun_gen and tun_gen != self._tunnel_gen:
             return

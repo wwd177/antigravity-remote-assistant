@@ -25,6 +25,12 @@ def _parse_float(value: str | None, default: float) -> float:
     return float(value.strip())
 
 
+def _parse_csv(value: str | None) -> tuple[str, ...]:
+    if not value or not value.strip():
+        return ()
+    return tuple(part.strip() for part in value.split(",") if part.strip())
+
+
 def resolve_agy_executable(configured: str) -> str:
     """Resolve agy binary path, checking common install locations on Windows / macOS / Linux."""
     configured = configured.strip() or "agy"
@@ -63,7 +69,8 @@ class BridgeConfig:
     agy_workspace: Path
     agy_model: str = ""
     agy_effort: str = ""
-    agy_dangerously_skip_permissions: bool = True
+    # Security default: MUST default to False everywhere so CLI permissions are never bypassed silently.
+    agy_dangerously_skip_permissions: bool = False
     agy_timeout_seconds: int = 300
     progress_notice_delay_seconds: int = 0
     log_level: str = "INFO"
@@ -77,6 +84,15 @@ class BridgeConfig:
     web_pwa_host: str = "0.0.0.0"
     web_pwa_port: int = 8765
     web_access_token: str = ""
+    # Hardened remote capability gates & multi-user beacon / proxy security settings
+    remote_desktop_enabled: bool = False
+    remote_clipboard_enabled: bool = False
+    beacon_enabled: bool = False
+    beacon_git_remote: str = ""
+    beacon_branch: str = "gh-pages"
+    public_base_url: str = ""
+    allowed_origins: tuple[str, ...] = ()
+    trust_cf_proxy_headers: bool = False
 
     def build_session_instructions(self) -> str:
         """Combine persona prompt and latest persistent user memory (re-read fresh per new session)."""
@@ -167,7 +183,7 @@ class BridgeConfig:
             agy_model=(_get("AGY_MODEL") or "").strip(),
             agy_effort=(_get("AGY_EFFORT") or "").strip(),
             agy_dangerously_skip_permissions=_parse_bool(
-                _get("AGY_DANGEROUSLY_SKIP_PERMISSIONS"), True
+                _get("AGY_DANGEROUSLY_SKIP_PERMISSIONS"), False
             ),
             agy_timeout_seconds=max(10, _parse_int(_get("AGY_TIMEOUT_SECONDS"), 300)),
             progress_notice_delay_seconds=max(
@@ -176,7 +192,7 @@ class BridgeConfig:
             log_level=(_get("LOG_LEVEL") or "INFO").strip().upper(),
             agy_system_prompt=system_prompt,
             user_memory_file=memory_file,
-            agy_prewarm=_parse_bool(_get("AGY_PREWARM"), True),
+            agy_prewarm=_parse_bool(_get("AGY_PREWARM"), False),
             agy_fallback_models=fallback_models,
             quota_cooldown_minutes=max(1, _parse_int(_get("QUOTA_COOLDOWN_MINUTES"), 60)),
             cache_clean_interval_hours=max(
@@ -186,4 +202,12 @@ class BridgeConfig:
             web_pwa_host=(_get("WEB_PWA_HOST") or "0.0.0.0").strip(),
             web_pwa_port=_parse_int(_get("WEB_PWA_PORT"), 8765),
             web_access_token=(_get("WEB_ACCESS_TOKEN") or "").strip(),
+            remote_desktop_enabled=_parse_bool(_get("REMOTE_DESKTOP_ENABLED"), False),
+            remote_clipboard_enabled=_parse_bool(_get("REMOTE_CLIPBOARD_ENABLED"), False),
+            beacon_enabled=_parse_bool(_get("BEACON_ENABLED"), False),
+            beacon_git_remote=(_get("BEACON_GIT_REMOTE") or "").strip(),
+            beacon_branch=(_get("BEACON_BRANCH") or "gh-pages").strip() or "gh-pages",
+            public_base_url=(_get("PUBLIC_BASE_URL") or "").strip().rstrip("/"),
+            allowed_origins=_parse_csv(_get("ALLOWED_ORIGINS")),
+            trust_cf_proxy_headers=_parse_bool(_get("TRUST_CF_PROXY_HEADERS"), False),
         )
