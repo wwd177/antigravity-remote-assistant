@@ -738,11 +738,13 @@ def _resolve_codex_rollout(codex_root: Path, cid: str) -> tuple[Path | None, str
     if state_db is not None:
         try:
             con = sqlite3.connect(f"file:{state_db}?mode=ro", uri=True, timeout=2.0)
-            row = con.execute(
-                "SELECT rollout_path, title, cwd FROM threads WHERE id = ?",
-                (cid,),
-            ).fetchone()
-            con.close()
+            try:
+                row = con.execute(
+                    "SELECT rollout_path, title, cwd FROM threads WHERE id = ?",
+                    (cid,),
+                ).fetchone()
+            finally:
+                con.close()
             if row:
                 rp = Path(_clean_win_path(str(row[0] or "")))
                 t = index_titles.get(cid) or _summarize_codex_title(str(row[1] or ""))
@@ -1007,11 +1009,13 @@ def load_conversation_detail(
             if db.is_file():
                 try:
                     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2.0)
-                    row = con.execute(
-                        "SELECT title, workspace_uris, status FROM conversation_summaries WHERE conversation_id = ?",
-                        (cid,),
-                    ).fetchone()
-                    con.close()
+                    try:
+                        row = con.execute(
+                            "SELECT title, workspace_uris, status FROM conversation_summaries WHERE conversation_id = ?",
+                            (cid,),
+                        ).fetchone()
+                    finally:
+                        con.close()
                     if row:
                         return ConversationDetail(
                             conversation_id=cid,
@@ -1034,11 +1038,13 @@ def load_conversation_detail(
     if db_path.is_file():
         try:
             con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
-            row = con.execute(
-                "SELECT title, workspace_uris, status FROM conversation_summaries WHERE conversation_id = ?",
-                (cid,),
-            ).fetchone()
-            con.close()
+            try:
+                row = con.execute(
+                    "SELECT title, workspace_uris, status FROM conversation_summaries WHERE conversation_id = ?",
+                    (cid,),
+                ).fetchone()
+            finally:
+                con.close()
             if row:
                 title = _clean_display_title(str(row[0] or ""), 60)
                 workspace = _parse_workspace_uris(str(row[1] or ""))

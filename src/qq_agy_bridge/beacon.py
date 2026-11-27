@@ -301,8 +301,8 @@ def detect_github_pages_info(project_dir: Path) -> tuple[str, str, str, str] | N
 STATIC_PWA_SW_JS = """\
 const SCOPE_SLUG = new URL(self.registration.scope).pathname.replace(/[^a-zA-Z0-9_-]/g, '_');
 const CACHE_PREFIX = 'antigravity-ios-shell-' + SCOPE_SLUG + '-';
-const CACHE_NAME = CACHE_PREFIX + 'v19';
-const LEGACY_EXACT = new Set(['antigravity-ios-shell-v16', 'antigravity-ios-shell-v17', 'antigravity-ios-shell-v18']);
+const CACHE_NAME = CACHE_PREFIX + 'v19' + '-__SHELL_HASH__';
+const LEGACY_EXACT = new Set(['antigravity-ios-shell-v16', 'antigravity-ios-shell-v17', 'antigravity-ios-shell-v18', 'antigravity-ios-shell-v19']);
 const REQUIRED_SHELL = ['./', './index.html'];
 const OPTIONAL_ASSETS = ['./apple-touch-icon.png', './icon-192.png', './icon-512.png', './manifest.json'];
 
@@ -353,7 +353,7 @@ self.addEventListener('fetch', (e) => {
 
   if (isNavShell) {
     e.respondWith(
-      fetchWithTimeout(e.request, 1800)
+      fetchWithTimeout(e.request, 3500)
         .then((res) => {
           if (!res || !res.ok) throw new Error('HTTP_' + (res ? res.status : 0));
           const clone = res.clone();
@@ -402,6 +402,7 @@ def build_static_pwa_bundle(
     access_token: str,
     tunnel_url: str,
     lan_url: str,
+    beacon_branch: str = "gh-pages",
 ) -> dict[str, Any]:
     """Assemble the complete static iOS Standalone PWA shell + encrypted `beacon.json` into `stage_dir`."""
     stage_dir.mkdir(parents=True, exist_ok=True)
@@ -409,16 +410,21 @@ def build_static_pwa_bundle(
     assets_dir = project_dir / "assets"
 
     html_text = src_html.read_text(encoding="utf-8")
-    # Inject repository beacon metadata attribute onto <html> so standalone shell knows its API beacon source
+    # Inject repository & branch metadata onto final <html>, then hash final HTML to derive SW cache version
     repo_slug = f"{owner}/{repo}"
+    safe_branch = _normalize_safe_beacon_branch(beacon_branch) or "gh-pages"
     html_text = html_text.replace(
         '<html lang="zh-CN">',
-        f'<html lang="zh-CN" data-beacon-repo="{repo_slug}">',
+        f'<html lang="zh-CN" data-beacon-repo="{repo_slug}" data-beacon-branch="{safe_branch}">',
         1,
     )
+    html_hash = hashlib.sha256(html_text.encode("utf-8")).hexdigest()[:10]
     (stage_dir / "index.html").write_text(html_text, encoding="utf-8")
     (stage_dir / ".nojekyll").write_text("", encoding="utf-8")
-    (stage_dir / "sw.js").write_text(STATIC_PWA_SW_JS, encoding="utf-8")
+    (stage_dir / "sw.js").write_text(
+        STATIC_PWA_SW_JS.replace("__SHELL_HASH__", html_hash),
+        encoding="utf-8",
+    )
 
     # Omit `start_url` so iOS/W3C Home Screen bookmark preserves `#key=...` during initial pairing!
     manifest = {
@@ -509,6 +515,7 @@ def publish_ios_pwa_and_beacon(
                 access_token=access_token,
                 tunnel_url=tunnel_url,
                 lan_url=lan_url,
+                beacon_branch=target_branch,
             )
 
             def _git(*args: str, timeout: int = 25) -> subprocess.CompletedProcess[str]:

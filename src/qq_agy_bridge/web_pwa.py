@@ -40,7 +40,7 @@ from websockets.asyncio.server import ServerConnection
 from websockets.datastructures import Headers
 from websockets.http11 import Request, Response
 
-from .agy_session import AgySession, SessionManager, TurnResult, _kill_process_tree_win32
+from .agy_session import STREAM_BUFFER_LIMIT, AgySession, SessionManager, TurnResult, _kill_process_tree_win32
 from .auth import AuthManager, cleanup_admin_state, write_admin_state
 from .beacon import resolve_explicit_beacon_target
 from .config import BridgeConfig
@@ -839,6 +839,7 @@ class WebPwaServer:
         self._clients_lock = asyncio.Lock()
         self._live_screen_stoppers: set[Callable[[], None]] = set()
         self._media_registry: OrderedDict[str, Path] = OrderedDict()
+        self._live_frame_registry: OrderedDict[str, Path] = OrderedDict()
         self._tasks: set[asyncio.Task[None]] = set()
 
         # Active slot currently displayed on mobile clients + per-slot isolated state
@@ -859,6 +860,7 @@ class WebPwaServer:
         self._processed_client_ids: OrderedDict[str, float] = OrderedDict()
         self._cancelled_reply_ids: set[str] = set()
         self._nav_seq: int = 0
+        self._watch_gen: int = 0
         self._ide_watch_sig: tuple[str, str, int, int] = ("", "", 0, 0)
         self.pc_ide_poll_interval: float = 0.55
         self.pc_ide_accept_timeout: float = 10.0
@@ -1066,17 +1068,18 @@ class WebPwaServer:
                 return {"Access-Control-Allow-Origin": origin_hdr, "Vary": "Origin"}
         return {}
 
-    def _extract_token(self, query: str, headers: Headers | None) -> str:
+    def _extract_credential_and_ticket(self, query: str, headers: Headers | None) -> tuple[str, str]:
         qs = parse_qs(query or "")
-        tok = (qs.get("token") or [""])[0].strip()
-        if tok:
-            return tok
+        q_tok = (qs.get("token") or [""])[0].strip()
+        ticket = (qs.get("ticket") or [""])[0].strip()
+        if q_tok:
+            return q_tok, ticket
         if headers is not None:
             auth_hdr = (headers.get("Authorization") or "").strip()
             if auth_hdr.lower().startswith("bearer "):
                 bearer = auth_hdr[7:].strip()
                 if bearer:
-                    return bearer
+                    return bearer, ticket
             raw_cookie = headers.get("Cookie", "")
             if raw_cookie:
                 try:
@@ -1085,10 +1088,14 @@ class WebPwaServer:
                     for ck_name in ("__Host-agy_session", "agy_session"):
                         morsel = jar.get(ck_name)
                         if morsel and morsel.value:
-                            return morsel.value.strip()
+                            return morsel.value.strip(), ticket
                 except Exception:
                     pass
-        return ""
+        return "", ticket
+
+    def _extract_token(self, query: str, headers: Headers | None) -> str:
+        cred, _ = self._extract_credential_and_ticket(query, headers)
+        return cred
 
     def _verify_token(self, token: str, ip: str, *, record_failure: bool = True) -> bool:
         ok, _ = self.auth.verify_credential(token, ip, record_failure=record_failure)
@@ -1105,6 +1112,92 @@ class WebPwaServer:
         while len(self._media_registry) > 400:
             self._media_registry.popitem(last=False)
         return media_id
+
+    def _media_ref(self, path: Path, **extra: Any) -> dict[str, Any]:
+        mid = self.register_media(path)
+        item: dict[str, Any] = {
+            "media_id": mid,
+            "media_ticket": self.auth.issue_media_ticket(mid, ttl_sec=3600.0),
+        }
+        item.update(extra)
+        return item
+
+    def register_live_frame(self, path: Path) -> str:
+        resolved = path.resolve()
+        for existing_id, existing_path in self._live_frame_registry.items():
+            if existing_path == resolved:
+                self._live_frame_registry.move_to_end(existing_id)
+                return existing_id
+        frame_id = f"lf-{uuid.uuid4().hex}"
+        self._live_frame_registry[frame_id] = resolved
+        while len(self._live_frame_registry) > 24:
+            self._live_frame_registry.popitem(last=False)
+        return frame_id
+
+    def _live_frame_ref(self, path: Path, **extra: Any) -> dict[str, Any]:
+        fid = self.register_live_frame(path)
+        item: dict[str, Any] = {
+            "media_id": fid,
+            "media_ticket": self.auth.issue_media_ticket(fid, ttl_sec=180.0),
+        }
+        item.update(extra)
+        return item
+
+    def _refresh_history_media_tickets(self, history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Return a shallow-safe copy of `history` with refreshed media tickets (never mutating stored dicts)."""
+        if not history:
+            return []
+        refreshed: list[dict[str, Any]] = []
+        for item in history:
+            if not isinstance(item, dict):
+                refreshed.append(item)
+                continue
+            item_copy = dict(item)
+            for key in ("images", "files", "attachments"):
+                raw_list = item.get(key)
+                if not isinstance(raw_list, list) or not raw_list:
+                    continue
+                new_list: list[Any] = []
+                for sub in raw_list:
+                    if not isinstance(sub, dict):
+                        new_list.append(sub)
+                        continue
+                    sub_copy = dict(sub)
+                    mid = str(sub_copy.get("media_id") or "").strip()
+                    if mid:
+                        if mid in self._media_registry or mid in self._live_frame_registry:
+                            ttl = 180.0 if mid in self._live_frame_registry else 3600.0
+                            sub_copy["media_ticket"] = self.auth.issue_media_ticket(mid, ttl_sec=ttl)
+                            sub_copy.pop("media_unavailable", None)
+                        else:
+                            sub_copy["media_ticket"] = ""
+                            sub_copy["media_unavailable"] = True
+                    new_list.append(sub_copy)
+                item_copy[key] = new_list
+            refreshed.append(item_copy)
+        return refreshed
+
+    @staticmethod
+    def _safe_int_param(val: Any, default: int, *, min_val: int, max_val: int) -> int:
+        if val is None or isinstance(val, bool):
+            return default
+        try:
+            n = int(val)
+        except (TypeError, ValueError):
+            return default
+        return max(min_val, min(max_val, n))
+
+    @staticmethod
+    def _safe_float_param(val: Any, default: float, *, min_val: float, max_val: float) -> float:
+        if val is None or isinstance(val, bool):
+            return default
+        try:
+            f = float(val)
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(f):
+            return default
+        return max(min_val, min(max_val, f))
 
     def _build_capabilities(self) -> dict[str, Any]:
         return {
@@ -1184,6 +1277,7 @@ class WebPwaServer:
         stale_ws: list[ServerConnection] = []
         async with self._clients_lock:
             self._media_registry.clear()
+            self._live_frame_registry.clear()
             for cli in list(self._clients):
                 ep = self._client_epochs.get(cli, 0)
                 if not self.auth.is_epoch_active(ep):
@@ -1304,6 +1398,7 @@ class WebPwaServer:
                         "application/json; charset=utf-8",
                         {"Cache-Control": "no-store"},
                     )
+                self.auth.clear_media_failures(ip)
                 return self._http_response(
                     200,
                     "OK",
@@ -1332,6 +1427,7 @@ class WebPwaServer:
                 )
             is_https = self._is_https_request(request.headers)
             exp_sec = 2592000 if is_https else 86400
+            self.auth.clear_media_failures(ip)
             sess_tok = self.auth.issue_session_token(ttl_sec=float(exp_sec))
             return self._http_response(
                 200,
@@ -1431,28 +1527,50 @@ class WebPwaServer:
         if path.startswith("/dl/"):
             cors = self._cors_headers(request.headers)
             ip = self._client_ip(connection, request.headers)
-            tok = self._extract_token(parsed.query, request.headers)
-            if not self._verify_token(tok, ip):
+            if self.auth.is_media_ip_locked(ip):
+                return self._http_response(
+                    429,
+                    "Too Many Requests",
+                    b"",
+                    "application/octet-stream",
+                    {"Cache-Control": "no-store", **cors},
+                )
+            cred, ticket = self._extract_credential_and_ticket(parsed.query, request.headers)
+            media_id = path.removeprefix("/dl/").strip("/")
+
+            ok_cred = bool(cred) and self.auth.verify_credential(cred, ip, record_failure=False)[0]
+            ticket_status = self.auth.verify_media_ticket_status(ticket, media_id) if ticket else "invalid"
+            if not (ok_cred or ticket_status == "valid"):
+                if ticket_status != "expired":
+                    self.auth.record_media_auth_failure(ip)
                 return self._http_response(
                     401,
                     "Unauthorized",
-                    b"Unauthorized",
-                    "text/plain",
+                    b"",
+                    "application/octet-stream",
                     {"Cache-Control": "no-store", **cors},
                 )
 
-            media_id = path.removeprefix("/dl/").strip("/")
-            target = self._media_registry.get(media_id)
+            target = self._media_registry.get(media_id) or self._live_frame_registry.get(media_id)
             if target is None or not is_safe_outbound_file(target, image_only=False):
                 return self._http_response(
                     404,
                     "Not Found",
-                    b"File Not Found",
+                    b"",
                     "text/plain",
                     {"Cache-Control": "no-store", **cors},
                 )
 
-            body = await asyncio.to_thread(target.read_bytes)
+            try:
+                body = await asyncio.to_thread(target.read_bytes)
+            except (FileNotFoundError, OSError):
+                return self._http_response(
+                    404,
+                    "Not Found",
+                    b"",
+                    "text/plain",
+                    {"Cache-Control": "no-store", **cors},
+                )
             mime, _ = mimetypes.guess_type(str(target))
             mime = mime or "application/octet-stream"
             disp_type = "inline" if mime.startswith("image/") else "attachment"
@@ -1607,9 +1725,9 @@ class WebPwaServer:
                         if uid in uploads:
                             uploads.pop(uid).abort()
                         safe_name = sanitize_filename(str(umsg.get("name") or "upload.bin"))
-                        size = int(umsg.get("size") or 0)
+                        size = self._safe_int_param(umsg.get("size"), -1, min_val=-1, max_val=MAX_UPLOAD_BYTES + 1)
                         if size < 0 or size > MAX_UPLOAD_BYTES:
-                            await self._safe_send(ws, {"type": "toast", "level": "err", "text": "文件超过 100MB 上限"})
+                            await self._safe_send(ws, {"type": "toast", "level": "err", "text": "文件大小无效或超过 100MB 上限"})
                             continue
                         PROJECT_INBOX_DIR.mkdir(parents=True, exist_ok=True)
                         dest = PROJECT_INBOX_DIR / f"pwa_{int(time.time())}_{uuid.uuid4().hex[:5]}_{safe_name}"
@@ -1646,15 +1764,14 @@ class WebPwaServer:
                         except Exception as exc:
                             await self._safe_send(ws, {"type": "toast", "level": "err", "text": f"上传校验未通过：{exc}"})
                             continue
-                        prune_inbox(PROJECT_INBOX_DIR, keep=40)
-                        mid = self.register_media(final_path)
+                        prune_inbox(PROJECT_INBOX_DIR, keep=40, prefix_only="pwa_")
                         is_img = final_path.suffix.lower() in ALLOWED_IMAGE_EXTS
                         await self._safe_send(
                             ws,
                             {
                                 "type": "upload_done",
                                 "upload_id": uid,
-                                "media_id": mid,
+                                **self._media_ref(final_path),
                                 "name": state.name,
                                 "path": str(final_path),
                                 "is_image": is_img,
@@ -1695,12 +1812,11 @@ class WebPwaServer:
                     asyncio.to_thread(capture_desktop_fast_jpeg_sync, PROJECT_INBOX_DIR),
                     asyncio.to_thread(get_desktop_cursor_ratio),
                 )
-                mid = self.register_media(shot)
                 await self._safe_send(
                     ws,
                     {
                         "type": "desktop_frame",
-                        "media_id": mid,
+                        **self._live_frame_ref(shot),
                         "ts": int(time.time() * 1000),
                         "cursor": cur_info,
                     },
@@ -1781,12 +1897,11 @@ class WebPwaServer:
                             asyncio.to_thread(capture_desktop_fast_jpeg_sync, PROJECT_INBOX_DIR),
                             asyncio.to_thread(get_desktop_cursor_ratio),
                         )
-                        mid = self.register_media(shot)
                         await self._safe_send(
                             ws,
                             {
                                 "type": "desktop_frame",
-                                "media_id": mid,
+                                **self._live_frame_ref(shot),
                                 "ts": int(time.time() * 1000),
                                 "cursor": cur_info,
                             },
@@ -1840,6 +1955,7 @@ class WebPwaServer:
                     "type": "hello",
                     "host_id": self.auth.host_id,
                     "auth_epoch": conn_epoch,
+                    "nav_seq": self._nav_seq,
                     "capabilities": self._build_capabilities(),
                     "slot": slot,
                     "model": hello_model,
@@ -1851,7 +1967,7 @@ class WebPwaServer:
                     "inflight": pub_inflight,
                     "slots_overview": self._build_slots_overview(),
                     "cooldowns": session.failover_pool.cooldown_summary(),
-                    "history": self._slot_history.get(slot, []),
+                    "history": self._refresh_history_media_tickets(self._slot_history.get(slot, [])),
                 },
             )
 
@@ -1886,7 +2002,7 @@ class WebPwaServer:
                         if not self._build_capabilities()["remote_desktop"]["enabled"]:
                             await _deny_capability("remote_desktop", "远程桌面画面流默认关闭，请在电脑端启动器开启")
                             continue
-                        interval = max(0.6, min(5.0, float(msg.get("interval_ms") or 750) / 1000.0))
+                        interval = self._safe_float_param(msg.get("interval_ms"), 750.0, min_val=600.0, max_val=5000.0) / 1000.0
 
                         async def _stream_screen() -> None:
                             timeout_streak = 0
@@ -1900,11 +2016,10 @@ class WebPwaServer:
                                         ),
                                         asyncio.to_thread(get_desktop_cursor_ratio),
                                     )
-                                    mid = self.register_media(shot)
                                     frame_raw = json.dumps(
                                         {
                                             "type": "desktop_frame",
-                                            "media_id": mid,
+                                            **self._live_frame_ref(shot),
                                             "ts": int(time.time() * 1000),
                                             "cursor": cur_info,
                                         },
@@ -1935,14 +2050,14 @@ class WebPwaServer:
                     _spawn_ws_task(self._handle_list_conversations(ws), coalesce_key="list_conversations")
 
                 elif mtype == "select_conversation":
-                    max_m = int(msg.get("max_messages") or 200)
+                    max_m = self._safe_int_param(msg.get("max_messages"), 200, min_val=50, max_val=3000)
                     t = asyncio.create_task(
                         self._handle_select_conversation(
                             ws,
                             str(msg.get("conversation_id") or ""),
                             str(msg.get("store") or "auto"),
                             only_refresh=bool(msg.get("only_refresh", False)),
-                            max_messages=max(50, min(3000, max_m)),
+                            max_messages=max_m,
                         )
                     )
                     self._tasks.add(t)
@@ -2078,7 +2193,7 @@ class WebPwaServer:
         if prev.get("ok"):
             resolved = _resolve_inside_workspace(session.workspace, rel_path)
             if resolved is not None and is_safe_outbound_file(resolved, image_only=False):
-                prev["media_id"] = self.register_media(resolved)
+                prev.update(self._media_ref(resolved))
         await self._safe_send(ws, {"type": "workspace_file", **prev})
 
     def _convert_detail_to_pwa_history(self, detail: ConversationDetail, model_label: str) -> list[dict[str, Any]]:
@@ -2093,7 +2208,7 @@ class WebPwaServer:
                 atts = []
                 for p in m.image_paths:
                     if is_safe_outbound_file(p, image_only=True):
-                        atts.append({"media_id": self.register_media(p), "name": p.name, "is_image": True})
+                        atts.append(self._media_ref(p, name=p.name, is_image=True))
                 out.append(
                     {
                         "role": "user",
@@ -2112,9 +2227,9 @@ class WebPwaServer:
                         rp = p.resolve()
                         if rp not in seen_paths:
                             seen_paths.add(rp)
-                            imgs.append({"media_id": self.register_media(rp), "name": rp.name})
+                            imgs.append(self._media_ref(rp, name=rp.name))
                 fls = [
-                    {"media_id": self.register_media(p), "name": p.name, "size": self._safe_file_size(p)}
+                    self._media_ref(p, name=p.name, size=self._safe_file_size(p))
                     for p in extra_files
                 ]
                 out.append(
@@ -2184,6 +2299,7 @@ class WebPwaServer:
         nav_token = 0
         if not only_refresh:
             self._nav_seq += 1
+            self._watch_gen += 1
             nav_token = self._nav_seq
 
         detail = await asyncio.to_thread(
@@ -2300,6 +2416,7 @@ class WebPwaServer:
         await self._broadcast(
             {
                 "type": "conversation_loaded",
+                "nav_seq": self._nav_seq,
                 "slot": slot_key,
                 "conversation_id": detail.conversation_id,
                 "title": detail.title,
@@ -2312,7 +2429,7 @@ class WebPwaServer:
                 "has_more": detail.has_more,
                 "total_messages": detail.total_messages,
                 "slots_overview": self._build_slots_overview(),
-                "history": loaded_history,
+                "history": self._refresh_history_media_tickets(loaded_history),
             }
         )
 
@@ -2327,6 +2444,7 @@ class WebPwaServer:
         silent_keep_view: bool = False,
     ) -> None:
         self._nav_seq += 1
+        self._watch_gen += 1
         nav_token = self._nav_seq
         new_slot = f"new:{uuid.uuid4().hex[:8]}"
         session = self._session_for_slot(new_slot)
@@ -2372,7 +2490,7 @@ class WebPwaServer:
         self._ide_watch_sig = ("", "", 0, 0)
 
         await self._broadcast(
-            {"type": "clear_history", "slot": new_slot, "req_id": req_id, "keep_view": silent_keep_view}
+            {"type": "clear_history", "nav_seq": self._nav_seq, "slot": new_slot, "req_id": req_id, "keep_view": silent_keep_view}
         )
         await self._broadcast_slots_overview()
         await self._broadcast(
@@ -2514,9 +2632,9 @@ class WebPwaServer:
                             "role": "assistant",
                             "id": cur_reply_id,
                             "text": seg_clean,
-                            "images": [{"media_id": self.register_media(p), "name": p.name} for p in md_imgs],
+                            "images": [self._media_ref(p, name=p.name) for p in md_imgs],
                             "files": [
-                                {"media_id": self.register_media(p), "name": p.name, "size": self._safe_file_size(p)}
+                                self._media_ref(p, name=p.name, size=self._safe_file_size(p))
                                 for p in md_files
                             ],
                             "steps": prev_steps,
@@ -2848,6 +2966,7 @@ class WebPwaServer:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(workspace) if workspace.is_dir() else None,
+                limit=STREAM_BUFFER_LIMIT,
                 **extra_kwargs,
             )
         except Exception as exc:
@@ -2902,7 +3021,26 @@ class WebPwaServer:
                 remaining = overall_deadline - time.monotonic()
                 if remaining <= 0:
                     raise asyncio.TimeoutError("Codex 执行超时")
-                raw_line = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
+                try:
+                    raw_line = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
+                except ValueError as exc:
+                    logger.warning("Codex stdout line exceeded buffer limit (%s): %s", codex_cid[:8] or "new", exc)
+                    if proc.returncode is None:
+                        try:
+                            if sys.platform == "win32" and proc.pid:
+                                await asyncio.to_thread(_kill_process_tree_win32, proc.pid)
+                            else:
+                                proc.kill()
+                            await asyncio.wait_for(proc.wait(), timeout=2.0)
+                        except Exception:
+                            pass
+                    return TurnResult(
+                        status="ERROR",
+                        response="\n\n".join(emitted_blocks),
+                        conversation_id=resolved_cid,
+                        active_model="Codex 电脑端",
+                        error="Codex 单行输出超过 10MB 安全上限，已安全终止该轮执行",
+                    )
                 if not raw_line:
                     break
                 line = raw_line.decode("utf-8", errors="replace").strip()
@@ -3075,6 +3213,11 @@ class WebPwaServer:
             "attachments": [
                 {
                     "media_id": a.get("media_id"),
+                    "media_ticket": (
+                        self.auth.issue_media_ticket(str(a.get("media_id") or ""))
+                        if (a.get("media_id") and str(a.get("media_id")) in self._media_registry)
+                        else str(a.get("media_ticket") or "")
+                    ),
                     "name": a.get("name"),
                     "is_image": bool(a.get("is_image")),
                 }
@@ -3586,9 +3729,9 @@ class WebPwaServer:
                         meta_cur["store"] = "cli"
                         meta_cur["title"] = raw_text[:36] or "新对话"
 
-            img_items = [{"media_id": self.register_media(p), "name": p.name} for p in img_paths]
+            img_items = [self._media_ref(p, name=p.name) for p in img_paths]
             file_items = [
-                {"media_id": self.register_media(p), "name": p.name, "size": self._safe_file_size(p)}
+                self._media_ref(p, name=p.name, size=self._safe_file_size(p))
                 for p in file_paths
             ]
 
@@ -3684,10 +3827,12 @@ class WebPwaServer:
         arg = parts[1].strip() if len(parts) > 1 else ""
 
         if cmd in {"/screen", "/shot"}:
+            if not self._build_capabilities()["remote_desktop"]["enabled"]:
+                await self._send_sys_reply(slot_key, "当前主机未启用远程桌面截屏权限。", session.model)
+                return True
             shot = await asyncio.to_thread(capture_desktop_fast_jpeg_sync, PROJECT_INBOX_DIR)
-            mid = self.register_media(shot)
             await self._send_sys_reply(
-                slot_key, "当前电脑桌面截图：", session.model, images=[{"media_id": mid, "name": shot.name}]
+                slot_key, "当前电脑桌面截图：", session.model, images=[self._media_ref(shot, name=shot.name)]
             )
             return True
 
@@ -3696,6 +3841,7 @@ class WebPwaServer:
             if not prev_store and self._pc_window_new_sender is not None:
                 prev_store = "ide"
             self._nav_seq += 1
+            self._watch_gen += 1
             new_slot = f"new:{uuid.uuid4().hex[:8]}"
             new_sess = self._session_for_slot(new_slot)
             await new_sess.start_new_conversation(workspace=str(session.workspace))
@@ -3703,7 +3849,7 @@ class WebPwaServer:
             self._slot_history[new_slot] = []
             self._slot_meta[new_slot] = {"conversation_id": "", "title": "反重力助手", "store": prev_store}
             self._ide_watch_sig = ("", "", 0, 0)
-            await self._broadcast({"type": "clear_history", "slot": new_slot})
+            await self._broadcast({"type": "clear_history", "nav_seq": self._nav_seq, "slot": new_slot})
             await self._broadcast_slots_overview()
             await self._broadcast(
                 {
@@ -3784,101 +3930,129 @@ class WebPwaServer:
 
         return False
 
+    async def _poll_ide_watch_once(self) -> None:
+        """Single watch tick: sync active PC transcript safely with zero awaits before commit."""
+        async with self._clients_lock:
+            has_clients = bool(self._clients)
+        if not has_clients:
+            return
+        cur_slot = self._active_slot
+        if cur_slot in self._slot_inflight:
+            return
+        session = self._session_for_slot(cur_slot)
+        meta_cur = self._slot_meta.get(cur_slot, {})
+        ide_cid = str(meta_cur.get("conversation_id") or session.linked_ide_id or "")
+        watch_store = str(meta_cur.get("store") or session.linked_store or "ide")
+        if not ide_cid or watch_store not in {"ide", "codex"}:
+            return
+
+        snap_nav = self._nav_seq
+        self._watch_gen += 1
+        snap_gen = self._watch_gen
+        snap = (snap_nav, cur_slot, ide_cid, watch_store)
+
+        sig = await asyncio.to_thread(
+            get_transcript_signature,
+            ide_cid,
+            watch_store,
+            self.ide_store_dir,
+            self.cli_store_dir,
+            self.codex_store_dir,
+        )
+        if sig == (0, 0) or (watch_store, ide_cid, sig[0], sig[1]) == self._ide_watch_sig:
+            return
+
+        detail = await asyncio.to_thread(
+            load_conversation_detail,
+            ide_cid,
+            watch_store,
+            200,
+            self.ide_store_dir,
+            self.cli_store_dir,
+            self.codex_store_dir,
+        )
+        if detail is None:
+            return
+
+        cont_detail: ConversationDetail | None = None
+        allow_cont_merge = (detail.store == "codex") or (detail.store == "ide" and self._pc_window_sender is None)
+        if allow_cont_merge:
+            cont_cid = (
+                self._continuation_map.get(f"{detail.store}:{detail.conversation_id}")
+                or self._continuation_map.get(detail.conversation_id)
+                or session.conversation_id
+            )
+            if cont_cid:
+                cont_detail = await asyncio.to_thread(
+                    load_conversation_detail,
+                    cont_cid,
+                    "cli",
+                    100,
+                    self.ide_store_dir,
+                    self.cli_store_dir,
+                    self.codex_store_dir,
+                )
+
+        # Zero-await concurrency guard: verify identity & ownership before committing watch state
+        meta_now = self._slot_meta.get(cur_slot, {})
+        now_cid = str(meta_now.get("conversation_id") or session.linked_ide_id or "")
+        now_store = str(meta_now.get("store") or session.linked_store or "ide")
+        if (
+            self._nav_seq != snap[0]
+            or self._watch_gen != snap_gen
+            or self._active_slot != snap[1]
+            or now_cid != snap[2]
+            or now_store != snap[3]
+            or cur_slot in self._slot_inflight
+        ):
+            return
+
+        self._ide_watch_sig = (watch_store, ide_cid, sig[0], sig[1])
+        if not session.conversation_id:
+            session._pending_handoff_context = build_ide_handoff_context(detail)
+
+        loaded_history = self._convert_detail_to_pwa_history(detail, session.model or "default")
+        if cont_detail and cont_detail.messages:
+            cont_hist = self._convert_detail_to_pwa_history(cont_detail, session.model or "default")
+            _extend_deduplicated_turns(loaded_history, cont_hist)
+            if any(int(x.get("ts") or 0) > 0 for x in loaded_history) and len(loaded_history) > 1:
+                running_ts = 0
+                keyed: list[tuple[int, int, dict[str, Any]]] = []
+                for idx_item, item in enumerate(loaded_history):
+                    raw_ts = int(item.get("ts") or 0)
+                    if raw_ts > 0:
+                        running_ts = raw_ts
+                    keyed.append((running_ts, idx_item, item))
+                loaded_history = [it for _, _, it in sorted(keyed, key=lambda t: (t[0], t[1]))]
+        if self._slot_local_turns.get(cur_slot) and detail.store != "ide":
+            _extend_deduplicated_turns(loaded_history, self._slot_local_turns[cur_slot])
+
+        self._slot_history[cur_slot] = loaded_history
+        await self._broadcast(
+            {
+                "type": "conversation_loaded",
+                "nav_seq": snap_nav,
+                "slot": cur_slot,
+                "conversation_id": detail.conversation_id,
+                "title": detail.title,
+                "store": detail.store,
+                "running": detail.running,
+                "busy": False,
+                "workspace": str(session.workspace),
+                "silent": True,
+                "has_more": detail.has_more,
+                "total_messages": detail.total_messages,
+                "history": self._refresh_history_media_tickets(loaded_history),
+            }
+        )
+
     async def _ide_watch_loop(self) -> None:
         """Auto-push live PC Antigravity / Codex transcript updates when viewing a PC chat."""
         while True:
             interval = getattr(self, "ide_watch_interval", 1.4)
             await asyncio.sleep(interval)
             try:
-                if not self._clients:
-                    continue
-                cur_slot = self._active_slot
-                if cur_slot in self._slot_inflight:
-                    continue
-                session = self._session_for_slot(cur_slot)
-                meta_cur = self._slot_meta.get(cur_slot, {})
-                ide_cid = str(meta_cur.get("conversation_id") or session.linked_ide_id or "")
-                watch_store = str(meta_cur.get("store") or session.linked_store or "ide")
-                if not ide_cid or watch_store not in {"ide", "codex"}:
-                    continue
-
-                sig = await asyncio.to_thread(
-                    get_transcript_signature,
-                    ide_cid,
-                    watch_store,
-                    self.ide_store_dir,
-                    self.cli_store_dir,
-                    self.codex_store_dir,
-                )
-                if sig == (0, 0) or (watch_store, ide_cid, sig[0], sig[1]) == self._ide_watch_sig:
-                    continue
-
-                self._ide_watch_sig = (watch_store, ide_cid, sig[0], sig[1])
-                detail = await asyncio.to_thread(
-                    load_conversation_detail,
-                    ide_cid,
-                    watch_store,
-                    200,
-                    self.ide_store_dir,
-                    self.cli_store_dir,
-                    self.codex_store_dir,
-                )
-                if detail is None or self._active_slot != cur_slot or cur_slot in self._slot_inflight:
-                    continue
-
-                if not session.conversation_id:
-                    session._pending_handoff_context = build_ide_handoff_context(detail)
-
-                loaded_history = self._convert_detail_to_pwa_history(detail, session.model or "default")
-                allow_cont_merge = (detail.store == "codex") or (detail.store == "ide" and self._pc_window_sender is None)
-                if allow_cont_merge:
-                    cont_cid = (
-                        self._continuation_map.get(f"{detail.store}:{detail.conversation_id}")
-                        or self._continuation_map.get(detail.conversation_id)
-                        or session.conversation_id
-                    )
-                    if cont_cid:
-                        cont_detail = await asyncio.to_thread(
-                            load_conversation_detail,
-                            cont_cid,
-                            "cli",
-                            100,
-                            self.ide_store_dir,
-                            self.cli_store_dir,
-                            self.codex_store_dir,
-                        )
-                        if cont_detail and cont_detail.messages:
-                            cont_hist = self._convert_detail_to_pwa_history(cont_detail, session.model or "default")
-                            _extend_deduplicated_turns(loaded_history, cont_hist)
-                            if any(int(x.get("ts") or 0) > 0 for x in loaded_history) and len(loaded_history) > 1:
-                                running_ts = 0
-                                keyed: list[tuple[int, int, dict[str, Any]]] = []
-                                for idx_item, item in enumerate(loaded_history):
-                                    raw_ts = int(item.get("ts") or 0)
-                                    if raw_ts > 0:
-                                        running_ts = raw_ts
-                                    keyed.append((running_ts, idx_item, item))
-                                loaded_history = [it for _, _, it in sorted(keyed, key=lambda t: (t[0], t[1]))]
-                if self._slot_local_turns.get(cur_slot) and detail.store != "ide":
-                    _extend_deduplicated_turns(loaded_history, self._slot_local_turns[cur_slot])
-
-                self._slot_history[cur_slot] = loaded_history
-                await self._broadcast(
-                    {
-                        "type": "conversation_loaded",
-                        "slot": cur_slot,
-                        "conversation_id": detail.conversation_id,
-                        "title": detail.title,
-                        "store": detail.store,
-                        "running": detail.running,
-                        "busy": False,
-                        "workspace": str(session.workspace),
-                        "silent": True,
-                        "has_more": detail.has_more,
-                        "total_messages": detail.total_messages,
-                        "history": loaded_history,
-                    }
-                )
+                await self._poll_ide_watch_once()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -3949,7 +4123,7 @@ class WebPwaServer:
                 raw_body = await asyncio.wait_for(reader.readexactly(clen), timeout=4.0)
 
             provided = hdrs.get("x-admin-token", "")
-            if not provided or not hmac.compare_digest(provided, self.admin_secret):
+            if not provided or not hmac.compare_digest(provided.encode("utf-8"), self.admin_secret.encode("utf-8")):
                 status, reason, payload = 403, "Forbidden", {"ok": False, "error": "forbidden"}
             elif method == "GET" and raw_path == "/admin/health":
                 async with self._clients_lock:

@@ -166,16 +166,19 @@ class AgySession:
             extra_kwargs["creationflags"] = CREATE_NO_WINDOW
 
         gen_before = getattr(self, "_cancel_gen", 0)
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=str(self.workspace),
-            env=env,
-            limit=STREAM_BUFFER_LIMIT,
-            **extra_kwargs,
-        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(self.workspace),
+                env=env,
+                limit=STREAM_BUFFER_LIMIT,
+                **extra_kwargs,
+            )
+        except OSError as exc:
+            raise RuntimeError(f"启动 agy 进程失败：{exc}") from exc
         if getattr(self, "_cancel_gen", 0) != gen_before:
             try:
                 if sys.platform == "win32" and proc.pid:
@@ -481,7 +484,15 @@ class AgySession:
         on_stream_reset: Callable[[], Awaitable[None]] | None = None,
         on_tool_start: Callable[[str], Awaitable[None]] | None = None,
     ) -> TurnResult:
-        proc = await self._ensure_started()
+        try:
+            proc = await self._ensure_started()
+        except (OSError, RuntimeError) as exc:
+            return TurnResult(
+                response="",
+                status="ERROR",
+                conversation_id=self.conversation_id,
+                error=f"启动会话进程失败：{exc}",
+            )
         assert proc.stdin is not None
         assert proc.stdout is not None
 
@@ -520,7 +531,15 @@ class AgySession:
         except (BrokenPipeError, ConnectionResetError):
             logger.warning("agy pipe broke before write for user=%s; restarting...", self.user_id)
             await self.stop(force_tree=True)
-            proc = await self._ensure_started()
+            try:
+                proc = await self._ensure_started()
+            except (OSError, RuntimeError) as exc:
+                return TurnResult(
+                    response="",
+                    status="ERROR",
+                    conversation_id=self.conversation_id,
+                    error=f"重建会话进程失败：{exc}",
+                )
             assert proc.stdin is not None
             assert proc.stdout is not None
             # Recompute in case conversation_id was empty and _ensure_started reset _persona_injected
@@ -559,7 +578,18 @@ class AgySession:
         async def _read_until_result() -> TurnResult:
             assert proc.stdout is not None
             while True:
-                raw_out = await proc.stdout.readline()
+                try:
+                    raw_out = await proc.stdout.readline()
+                except ValueError as exc:
+                    logger.warning("agy stdout line exceeded buffer limit: %s", exc)
+                    await self.stop(force_tree=True)
+                    return TurnResult(
+                        response="",
+                        status="ERROR",
+                        conversation_id=self.conversation_id,
+                        error="代理单行响应超过 10MB 缓冲上限，本轮进程已终止",
+                        tools_used=tools_used,
+                    )
                 if not raw_out:
                     rc = await proc.wait()
                     stderr_tail = "\n".join(self._stderr_lines[-8:]).strip()

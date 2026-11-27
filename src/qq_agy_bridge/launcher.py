@@ -537,22 +537,35 @@ def probe_tunnel_e2e_ping(tunnel_url: str, expected_service: str, timeout: float
     clean = (tunnel_url or "").strip().rstrip("/")
     if not clean:
         return False
-    req = urllib.request.Request(
-        f"{clean}/ping?_t={int(time.time())}",
-        headers={"Cache-Control": "no-store"},
-    )
+
+    def _parse_ping(resp: object) -> bool:
+        if getattr(resp, "status", 0) != 200:
+            return False
+        data = json.loads(resp.read(4096).decode("utf-8", errors="replace"))
+        return (
+            isinstance(data, dict)
+            and data.get("ok") is True
+            and data.get("service") == expected_service
+        )
+
+    hdrs = {"Cache-Control": "no-store", "User-Agent": "AntigravityLauncher/1.0"}
+    req1 = urllib.request.Request(f"{clean}/ping?_t={int(time.time())}", headers=hdrs)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            if resp.status != 200:
-                return False
-            data = json.loads(resp.read(4096).decode("utf-8", errors="replace"))
-            return (
-                isinstance(data, dict)
-                and data.get("ok") is True
-                and data.get("service") == expected_service
-            )
+        with urllib.request.urlopen(req1, timeout=timeout) as resp:
+            if _parse_ping(resp):
+                return True
     except Exception:
-        return False
+        pass
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    req2 = urllib.request.Request(f"{clean}/ping?_t={int(time.time())}", headers=hdrs)
+    try:
+        with opener.open(req2, timeout=min(float(timeout), 4.0)) as resp:
+            if _parse_ping(resp):
+                return True
+    except Exception:
+        pass
+    return False
 
 
 def find_external_server_processes(exclude_pids: set[int]) -> list[int]:
@@ -699,18 +712,20 @@ class LauncherApp:
         self._busy = False
         self._closing = False
 
-        gh_info = (
-            resolve_explicit_beacon_target(
-                settings.project_dir,
-                beacon_enabled=settings.beacon_enabled,
-                explicit_remote=settings.beacon_git_remote,
-                allow_upstream_protected=settings.beacon_allow_upstream,
-            )
-            if settings.beacon_enabled
-            else None
-        )
-        self._ios_pages_url: str = gh_info[3] if gh_info else ""
+        self._ios_pages_url: str = ""
         self._beacon_synced: bool = False
+        self._beacon_syncing: bool = False
+        self._beacon_retry_count: int = 0
+        self._beacon_last_attempt_mono: float = 0.0
+        self._beacon_last_error: str = ""
+        self._beacon_sync_lock = threading.Lock()
+        self._beacon_publish_gen: int = 0
+        self._beacon_last_started_gen: int = -1
+        self._beacon_pending_resync: tuple[str, int] | None = None
+        self._poll_state_lock = threading.Lock()
+        self._poll_running: bool = False
+        self._poll_rerun_pending: bool = False
+        self._refresh_beacon_target_from_settings()
         self._active_pair_code: str = ""
         self._active_pair_issued_mono: float = 0.0
         self._qr_mode = tk.StringVar(
@@ -1485,6 +1500,19 @@ class LauncherApp:
         except Exception:
             return None
 
+    def _refresh_beacon_target_from_settings(self) -> None:
+        gh_info = (
+            resolve_explicit_beacon_target(
+                self.settings.project_dir,
+                beacon_enabled=self.settings.beacon_enabled,
+                explicit_remote=self.settings.beacon_git_remote,
+                allow_upstream_protected=self.settings.beacon_allow_upstream,
+            )
+            if self.settings.beacon_enabled
+            else None
+        )
+        self._ios_pages_url = gh_info[3] if gh_info else ""
+
     def _refresh_pair_code_worker(self) -> None:
         res = self._admin_request("POST", "/admin/pair")
         if res and res.get("ok") and res.get("code"):
@@ -1499,10 +1527,16 @@ class LauncherApp:
             self._enqueue_log("安全", "撤销失败：反重力网关未就绪或写入 .env 失败。", "err")
             return
         self.settings = load_settings()
+        self._refresh_beacon_target_from_settings()
         closed_n = int(res.get("closed_clients") or 0)
         new_ep = int(res.get("auth_epoch") or 0)
         self._active_pair_code = ""
+        with self._beacon_sync_lock:
+            self._beacon_publish_gen += 1
+            rev_gen = self._beacon_publish_gen
         self._beacon_synced = False
+        self._beacon_retry_count = 0
+        self._beacon_last_error = ""
         pair_res = self._admin_request("POST", "/admin/pair")
         if pair_res and pair_res.get("ok") and pair_res.get("code"):
             self._active_pair_code = str(pair_res["code"])
@@ -1515,11 +1549,19 @@ class LauncherApp:
         )
         if self._ios_pages_url and self.settings.beacon_enabled:
             sync_url = self.settings.public_base_url or self._tunnel_url or f"http://{get_lan_ipv4()}:{self.settings.web_pwa_port}"
-            threading.Thread(
-                target=self._sync_ios_beacon_worker,
-                args=(sync_url, self._tunnel_gen),
-                daemon=True,
-            ).start()
+            need_spawn = False
+            with self._beacon_sync_lock:
+                if self._beacon_syncing:
+                    self._beacon_pending_resync = (sync_url, self._tunnel_gen)
+                elif self._beacon_last_started_gen < rev_gen:
+                    self._beacon_last_started_gen = rev_gen
+                    need_spawn = True
+            if need_spawn:
+                threading.Thread(
+                    target=self._sync_ios_beacon_worker,
+                    args=(sync_url, self._tunnel_gen),
+                    daemon=True,
+                ).start()
 
     def _current_qr_url(self) -> str:
         tok = self.settings.web_access_token
@@ -1568,8 +1610,13 @@ class LauncherApp:
                     )
                     lbl = "请用「Wi-Fi」/「外网」配对，或先 Fork 开启信标"
                 else:
-                    msg = "\n正在向自有仓库同步并验真 iOS 永久信标...\n（未验真前不显示永久二维码）\n"
-                    lbl = "等待加密信标验真..."
+                    err_hint = f"\n最近状态：{self._beacon_last_error[:60]}" if self._beacon_last_error else ""
+                    if self._beacon_retry_count >= 5:
+                        msg = f"\n永久信标同步多次失败，已暂停自动重试\n请点击下方「刷新公网」或重启恢复{err_hint}\n"
+                        lbl = "自动重试已达上限，请点击「刷新公网」重试"
+                    else:
+                        msg = f"\n正在向自有仓库同步并验真 iOS 永久信标...\n（未验真前不显示永久二维码）{err_hint}\n"
+                        lbl = "等待加密信标验真（失败将每 45s 自动重试）..."
                 self.qr_img_lbl.configure(image="", text=msg)
                 self.qr_url_lbl.configure(text=lbl)
             elif m == "lan":
@@ -1790,6 +1837,33 @@ class LauncherApp:
         self.root.after(3500, self._schedule_health_poll)
 
     def _health_poll_worker(self, force: bool = False) -> None:
+        with self._poll_state_lock:
+            if self._poll_running:
+                if force:
+                    self._poll_rerun_pending = True
+                return
+            self._poll_running = True
+        try:
+            while True:
+                try:
+                    self._health_poll_once(force=force)
+                except Exception as exc:
+                    if not self._closing and hasattr(self, "_enqueue_log"):
+                        self._enqueue_log("系统", f"健康轮询异常：{exc}", "warn")
+                with self._poll_state_lock:
+                    if self._poll_rerun_pending and not self._closing:
+                        self._poll_rerun_pending = False
+                        force = True
+                        continue
+                    self._poll_running = False
+                    return
+        except BaseException:
+            with self._poll_state_lock:
+                self._poll_running = False
+                self._poll_rerun_pending = False
+            raise
+
+    def _health_poll_once(self, force: bool = False) -> None:
         if self._closing or (self._busy and not force):
             return
         gw_ident = probe_agy_gateway_identity("127.0.0.1", self.settings.web_pwa_port, timeout=0.45)
@@ -1924,6 +1998,23 @@ class LauncherApp:
             finally:
                 self._op_lock.release()
 
+        if (
+            self.settings.beacon_enabled
+            and self._ios_pages_url
+            and self._tunnel_url
+            and tun_alive
+            and not self._beacon_synced
+            and not self._beacon_syncing
+            and self._beacon_retry_count < 5
+            and (self._beacon_last_attempt_mono == 0.0 or (now_m - self._beacon_last_attempt_mono) >= 45.0)
+            and not self._closing
+        ):
+            threading.Thread(
+                target=self._sync_ios_beacon_worker,
+                args=(self._tunnel_url, self._tunnel_gen),
+                daemon=True,
+            ).start()
+
         self._post_ui(
             lambda p=pwa_open, s=srv_alive, t=tun_alive, r=tun_ready: self._refresh_status_ui(p, s, t, r)
         )
@@ -2036,6 +2127,7 @@ class LauncherApp:
             set_prevent_system_sleep(True)
         self._auto_restart_timestamps.clear()
         self.settings = load_settings()
+        self._refresh_beacon_target_from_settings()
         self._post_ui(self._render_inline_qr)
         threading.Thread(target=self._refresh_conv_stats_bg, daemon=True).start()
 
@@ -2148,6 +2240,10 @@ class LauncherApp:
         self._tunnel_last_e2e_check_mono = 0.0
         self._tunnel_e2e_fail_count = 0
         self._tunnel_url = ""
+        self._beacon_synced = False
+        self._beacon_retry_count = 0
+        self._beacon_last_attempt_mono = 0.0
+        self._beacon_last_error = ""
         cmd = [
             str(cf_exe),
             "tunnel",
@@ -2271,35 +2367,84 @@ class LauncherApp:
             return
         if not self._ios_pages_url or not tunnel_url or (tun_gen and tun_gen != self._tunnel_gen):
             return
-        lan_url = f"http://{get_lan_ipv4()}:{self.settings.web_pwa_port}"
-        ok, info = publish_ios_pwa_and_beacon(
-            self.settings.project_dir,
-            access_token=self.settings.web_access_token,
-            tunnel_url=tunnel_url,
-            lan_url=lan_url,
-            beacon_enabled=self.settings.beacon_enabled,
-            explicit_remote=self.settings.beacon_git_remote,
-            allow_upstream_protected=self.settings.beacon_allow_upstream,
-            beacon_branch=self.settings.beacon_branch,
-        )
-        if tun_gen and tun_gen != self._tunnel_gen:
-            return
-        if ok:
-            self._beacon_synced = True
-            self._enqueue_log(
-                "Tunnel",
-                f"✓ 已自动同步 iPhone 永久 App 加密信标 -> {info} （添加到主屏幕后重启电脑也永久直连）",
-                "tunnel",
+        with self._beacon_sync_lock:
+            if self._beacon_syncing:
+                self._beacon_pending_resync = (tunnel_url, tun_gen)
+                return
+            self._beacon_syncing = True
+            self._beacon_pending_resync = None
+            pub_gen = self._beacon_publish_gen
+            self._beacon_last_started_gen = pub_gen
+            snap_token = self.settings.web_access_token
+            self._beacon_last_attempt_mono = time.monotonic()
+        pending: tuple[str, int] | None = None
+        try:
+            lan_url = f"http://{get_lan_ipv4()}:{self.settings.web_pwa_port}"
+            ok, info = publish_ios_pwa_and_beacon(
+                self.settings.project_dir,
+                access_token=snap_token,
+                tunnel_url=tunnel_url,
+                lan_url=lan_url,
+                beacon_enabled=self.settings.beacon_enabled,
+                explicit_remote=self.settings.beacon_git_remote,
+                allow_upstream_protected=self.settings.beacon_allow_upstream,
+                beacon_branch=self.settings.beacon_branch,
             )
+            if (
+                (tun_gen and tun_gen != self._tunnel_gen)
+                or pub_gen != self._beacon_publish_gen
+                or snap_token != self.settings.web_access_token
+            ):
+                return
+            if ok:
+                self._beacon_synced = True
+                self._beacon_retry_count = 0
+                self._beacon_last_error = ""
+                self._enqueue_log(
+                    "Tunnel",
+                    f"✓ 已自动同步 iPhone 永久 App 加密信标 -> {info} （添加到主屏幕后重启电脑也永久直连）",
+                    "tunnel",
+                )
+            else:
+                self._beacon_synced = False
+                self._beacon_retry_count += 1
+                self._beacon_last_error = str(info or "同步未完成")
+                self._enqueue_log("Tunnel", f"提示：永久 App 信标同步跳过 ({info})", "warn")
             self._post_ui(self._render_inline_qr)
-        else:
-            self._enqueue_log("Tunnel", f"提示：永久 App 信标同步跳过 ({info})", "warn")
+        finally:
+            self._beacon_last_attempt_mono = time.monotonic()
+            with self._beacon_sync_lock:
+                self._beacon_syncing = False
+                pending = self._beacon_pending_resync
+                self._beacon_pending_resync = None
+                if (
+                    pending is None
+                    and (pub_gen != self._beacon_publish_gen or snap_token != self.settings.web_access_token)
+                    and self._beacon_last_started_gen < self._beacon_publish_gen
+                    and self.settings.beacon_enabled
+                    and self._ios_pages_url
+                    and not self._closing
+                ):
+                    self._beacon_last_started_gen = self._beacon_publish_gen
+                    next_url = (
+                        self.settings.public_base_url
+                        or self._tunnel_url
+                        or tunnel_url
+                    )
+                    pending = (next_url, self._tunnel_gen)
+            if pending is not None and not self._closing:
+                threading.Thread(
+                    target=self._sync_ios_beacon_worker,
+                    args=pending,
+                    daemon=True,
+                ).start()
 
     def _stop_all_worker(self, include_external: bool) -> None:
         self._desired_running = False
         set_prevent_system_sleep(False)
         self._enqueue_log("系统", "正在停止反重力助手后台服务...", "sys")
         self._stop_all_internal(include_external=include_external)
+        self._active_pair_code = ""
         self._post_ui(self._render_inline_qr)
         self._enqueue_log("系统", "所有服务已安全停止。", "sys")
 
@@ -2314,6 +2459,7 @@ class LauncherApp:
         self._tunnel_ready_conns = 0
         self._tunnel_unready_since_mono = 0.0
         self._tunnel_e2e_fail_count = 0
+        self._beacon_synced = False
 
         if self._server_proc and self._server_proc.poll() is None:
             kill_pid_tree(self._server_proc.pid)
@@ -2345,7 +2491,9 @@ class LauncherApp:
         self.log_text.configure(state=tk.DISABLED)
 
     def _has_running_managed_services(self) -> bool:
-        return self._server_proc is not None and self._server_proc.poll() is None
+        srv_alive = self._server_proc is not None and self._server_proc.poll() is None
+        tun_alive = self._tunnel_proc is not None and self._tunnel_proc.poll() is None
+        return srv_alive or tun_alive
 
     def _on_close_requested(self) -> None:
         if self._has_running_managed_services():
@@ -2389,6 +2537,7 @@ class LauncherApp:
             return
 
         self._closing = True
+        self._stop_all_internal(include_external=False)
         self.root.destroy()
 
 

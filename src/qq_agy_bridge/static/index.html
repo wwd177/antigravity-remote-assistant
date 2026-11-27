@@ -3366,6 +3366,7 @@
   const incomingToken = incomingHashKey || incomingQueryKey;
   let pendingPairCode = '';
   let serverCapabilities = null;
+  let lastAppliedNavSeq = 0;
 
   if (incomingPair && !isStaticShell) {
     pendingPairCode = incomingPair;
@@ -3592,6 +3593,8 @@
   let pingTimer = null;
   let lastRttMs = null;
   let optimisticWaitRowId = null;
+  let optimisticWaitClientId = '';
+  let pendingReattachCid = '';
   let activeSlot = '';
   let activeConvId = '';
   let activeConvStore = '';
@@ -3984,8 +3987,42 @@
     }
   }
 
-  function mediaUrl(mediaId) {
+  const mediaTicketCache = new Map();
+  function rememberMediaTicket(mediaId, mediaTicket) {
+    const mid = String(mediaId || '').trim();
+    const t = String(mediaTicket || '').trim();
+    if (!mid || !t) return;
+    if (mediaTicketCache.has(mid)) mediaTicketCache.delete(mid);
+    mediaTicketCache.set(mid, t);
+    if (mediaTicketCache.size > 500) {
+      const firstKey = mediaTicketCache.keys().next().value;
+      if (firstKey !== undefined) mediaTicketCache.delete(firstKey);
+    }
+  }
+  function collectMessageMediaTickets(item) {
+    const map = new Map();
+    if (!item || typeof item !== 'object') return map;
+    ['images', 'files', 'attachments'].forEach((k) => {
+      const arr = item[k];
+      if (!Array.isArray(arr)) return;
+      arr.forEach((sub) => {
+        if (sub && typeof sub === 'object' && sub.media_id && sub.media_ticket) {
+          const mid = String(sub.media_id).trim();
+          const mt = String(sub.media_ticket).trim();
+          if (mid && mt) {
+            map.set(mid, mt);
+            rememberMediaTicket(mid, mt);
+          }
+        }
+      });
+    });
+    return map;
+  }
+
+  function mediaUrl(mediaId, mediaTicket = '') {
     const base = `${apiBase}/dl/${encodeURIComponent(mediaId)}`;
+    const t = String(mediaTicket || '').trim() || mediaTicketCache.get(String(mediaId || '').trim()) || '';
+    if (t) return `${base}?ticket=${encodeURIComponent(t)}`;
     return token ? `${base}?token=${encodeURIComponent(token)}` : base;
   }
 
@@ -4045,15 +4082,29 @@
     return String(s || '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   }
 
-  function formatInlineMarkdown(escapedLine) {
+  function formatInlineMarkdown(escapedLine, ticketMap = null) {
     const codeSlots = [];
     let s = escapedLine.replace(/`([^`\n]+)`/g, (_, code) => {
       const idx = codeSlots.push(`<code>${code}</code>`) - 1;
       return `\x00C${idx}\x00`;
     });
-    // Markdown images pointing to http/https or /dl/
+    // Markdown images pointing to http/https or /dl/ (cross-origin resolves /dl/ via apiBase + media_ticket)
     s = s.replace(/!\[([^\]]*)\]\(((?:https?:\/\/|\/dl\/)[^\s)]+)\)/g, (_, alt, url) => {
-      const idx = codeSlots.push(`<img class="chat-img" src="${url}" alt="${alt}" />`) - 1;
+      let finalUrl = url;
+      if (url.startsWith('/dl/')) {
+        const rawTail = url.slice(4);
+        const qPos = rawTail.indexOf('?');
+        const rawId = qPos >= 0 ? rawTail.slice(0, qPos) : rawTail;
+        let decId = rawId;
+        try { decId = decodeURIComponent(rawId); } catch (_) {}
+        let qTicket = '';
+        if (qPos >= 0) {
+          try { qTicket = new URLSearchParams(rawTail.slice(qPos + 1).replace(/&amp;/g, '&')).get('ticket') || ''; } catch (_) {}
+        }
+        const ticket = (ticketMap && ticketMap.get(decId)) || mediaTicketCache.get(decId) || qTicket || '';
+        finalUrl = escapeHtml(mediaUrl(decId, ticket));
+      }
+      const idx = codeSlots.push(`<img class="chat-img" src="${finalUrl}" alt="${alt}" />`) - 1;
       return `\x00C${idx}\x00`;
     });
     s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (_, label, url) => {
@@ -4066,7 +4117,7 @@
     return s;
   }
 
-  function renderMarkdownBlocks(textBlock) {
+  function renderMarkdownBlocks(textBlock, ticketMap = null) {
     const lines = textBlock.split('\n');
     const out = [];
     let i = 0;
@@ -4086,13 +4137,13 @@
       const hm = trimmed.match(/^(#{1,4})\s+(.+)$/);
       if (hm) {
         const lvl = hm[1].length;
-        out.push(`<h${lvl}>${formatInlineMarkdown(escapeHtml(hm[2]))}</h${lvl}>`);
+        out.push(`<h${lvl}>${formatInlineMarkdown(escapeHtml(hm[2]), ticketMap)}</h${lvl}>`);
         i++;
         continue;
       }
 
       if (trimmed.includes('|') && i + 1 < lines.length && /^\s*\|?[\s:-]+\|[\s|:-]*$/.test(lines[i + 1])) {
-        const parseCells = (rowStr) => rowStr.trim().replace(/^\||\|$/g, '').split('|').map((c) => formatInlineMarkdown(escapeHtml(c.trim())));
+        const parseCells = (rowStr) => rowStr.trim().replace(/^\||\|$/g, '').split('|').map((c) => formatInlineMarkdown(escapeHtml(c.trim()), ticketMap));
         const headers = parseCells(rawLine);
         i += 2;
         const bodyRows = [];
@@ -4109,7 +4160,7 @@
       if (/^\s*(?:>|&gt;)/.test(rawLine)) {
         const qLines = [];
         while (i < lines.length && /^\s*(?:>|&gt;)/.test(lines[i])) {
-          qLines.push(formatInlineMarkdown(escapeHtml(lines[i].replace(/^\s*(?:>|&gt;)\s?/, ''))));
+          qLines.push(formatInlineMarkdown(escapeHtml(lines[i].replace(/^\s*(?:>|&gt;)\s?/, '')), ticketMap));
           i++;
         }
         if (i === loopStart) i++;
@@ -4120,7 +4171,7 @@
       if (/^\s*[-*•]\s+/.test(rawLine)) {
         const items = [];
         while (i < lines.length && /^\s*[-*•]\s+/.test(lines[i])) {
-          items.push(`<li>${formatInlineMarkdown(escapeHtml(lines[i].replace(/^\s*[-*•]\s+/, '')))}</li>`);
+          items.push(`<li>${formatInlineMarkdown(escapeHtml(lines[i].replace(/^\s*[-*•]\s+/, '')), ticketMap)}</li>`);
           i++;
         }
         out.push(`<ul>${items.join('')}</ul>`);
@@ -4130,7 +4181,7 @@
       if (/^\s*\d+\.\s+/.test(rawLine)) {
         const items = [];
         while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) {
-          items.push(`<li>${formatInlineMarkdown(escapeHtml(lines[i].replace(/^\s*\d+\.\s+/, '')))}</li>`);
+          items.push(`<li>${formatInlineMarkdown(escapeHtml(lines[i].replace(/^\s*\d+\.\s+/, '')), ticketMap)}</li>`);
           i++;
         }
         out.push(`<ol>${items.join('')}</ol>`);
@@ -4143,7 +4194,7 @@
         lines[i].trim() &&
         !/^(#{1,4}\s+|-{3,}$|\*{3,}$|\s*[-*•]\s+|\s*\d+\.\s+|\s*(?:>|&gt;))/.test(lines[i])
       ) {
-        pLines.push(formatInlineMarkdown(escapeHtml(lines[i])));
+        pLines.push(formatInlineMarkdown(escapeHtml(lines[i]), ticketMap));
         i++;
       }
       if (pLines.length) out.push(`<p>${pLines.join('<br/>')}</p>`);
@@ -4209,7 +4260,7 @@
     $('canvasModal').classList.add('show');
   }
 
-  function renderRichText(raw) {
+  function renderRichText(raw, ticketMap = null) {
     if (!raw) return '';
     const parts = String(raw).split(/(```[\s\S]*?```)/g);
     return parts.map((part) => {
@@ -4234,7 +4285,7 @@
           : '';
         return `<div class="code-card${isLong ? ' collapsed' : ''}"><div class="code-hdr"><span>${escapeHtml(lang)}${lineCount > 4 ? ' · ' + lineCount + ' 行' : ''}</span><div>${prevBtnHtml}<button type="button" class="copy-code-btn">复制代码</button></div></div><pre><code>${code}</code></pre>${expandHtml}</div>`;
       }
-      return renderMarkdownBlocks(part);
+      return renderMarkdownBlocks(part, ticketMap);
     }).join('');
   }
 
@@ -4689,15 +4740,17 @@
       grid.className = 'media-grid';
       grid.style.marginBottom = item.text ? '8px' : '0';
       item.attachments.forEach((a) => {
+        if (a.media_id && a.media_ticket) rememberMediaTicket(a.media_id, a.media_ticket);
+        const mt = a.media_ticket || '';
         if (a.is_image && a.media_id) {
           const img = document.createElement('img');
           img.className = 'chat-img';
-          img.src = mediaUrl(a.media_id);
+          img.src = mediaUrl(a.media_id, mt);
           grid.appendChild(img);
         } else if (a.media_id) {
           const link = document.createElement('a');
           link.className = 'file-card';
-          link.href = mediaUrl(a.media_id);
+          link.href = mediaUrl(a.media_id, mt);
           link.textContent = '📎 ' + (a.name || '附件');
           grid.appendChild(link);
         }
@@ -4853,7 +4906,8 @@
     const bub = document.getElementById('bub-' + item.id);
     const act = document.getElementById('act-' + item.id);
     const orig = document.getElementById('orig-' + item.id);
-    bub.innerHTML = renderRichText(item.text || '');
+    const ticketMap = collectMessageMediaTickets(item);
+    bub.innerHTML = renderRichText(item.text || '', ticketMap);
     if (orig && item.model) {
       orig.textContent = shortModelName(item.model);
     }
@@ -4864,7 +4918,7 @@
       item.images.forEach((im) => {
         const img = document.createElement('img');
         img.className = 'chat-img';
-        img.src = mediaUrl(im.media_id);
+        img.src = mediaUrl(im.media_id, im.media_ticket || ticketMap.get(im.media_id) || '');
         img.alt = im.name || '截图';
         grid.appendChild(img);
       });
@@ -4874,7 +4928,7 @@
       item.files.forEach((f) => {
         const a = document.createElement('a');
         a.className = 'file-card';
-        a.href = mediaUrl(f.media_id);
+        a.href = mediaUrl(f.media_id, f.media_ticket || ticketMap.get(f.media_id) || '');
         a.download = f.name || '';
         const kb = f.size ? ` (${(f.size / 1024).toFixed(1)} KB)` : '';
         a.textContent = `📥 下载 ${f.name || '文件'}${kb}`;
@@ -5080,7 +5134,9 @@
         cache: 'no-store',
         signal: ctrl.signal,
       });
-      return res.ok;
+      if (!res.ok) return false;
+      const data = await res.json();
+      return Boolean(data && data.ok === true && data.service === 'antigravity-assistant');
     } catch (_) {
       return false;
     } finally {
@@ -5151,15 +5207,17 @@
     sourcePromises.push(tryEnvelopePromise(fetchJsonWithTimeout(`./beacon.json?_t=${Date.now()}`, 6500)));
 
     if (beaconRepo) {
+      const beaconBranch = (document.documentElement.getAttribute('data-beacon-branch') || 'gh-pages').trim() || 'gh-pages';
+      const branchPath = beaconBranch.split('/').map(encodeURIComponent).join('/');
       sourcePromises.push(tryEnvelopePromise(
         fetchJsonWithTimeout(
-          `https://raw.githubusercontent.com/${beaconRepo}/gh-pages/beacon.json?_t=${Date.now()}`,
+          `https://raw.githubusercontent.com/${beaconRepo}/${branchPath}/beacon.json?_t=${Date.now()}`,
           6500
         )
       ));
       sourcePromises.push(tryEnvelopePromise(
         fetchJsonWithTimeout(
-          `https://api.github.com/repos/${beaconRepo}/contents/beacon.json?ref=gh-pages&_t=${Date.now()}`,
+          `https://api.github.com/repos/${beaconRepo}/contents/beacon.json?ref=${encodeURIComponent(beaconBranch)}&_t=${Date.now()}`,
           6500,
           { Accept: 'application/vnd.github.v3+json' }
         ).then((meta) => JSON.parse(atob(String(meta.content || '').replace(/\s+/g, ''))))
@@ -5206,9 +5264,12 @@
     connectWatchdog = setTimeout(() => {
       if (epochToken === connEpoch && ws === sock && sock.readyState === 0) {
         connEpoch++;
+        clearInterval(pingTimer);
+        clearPongWatchdog();
         ws = null;
         try { sock.close(); } catch (_) {}
         const delay = Math.min(6000, 500 * Math.pow(1.45, Math.min(reconnectAttempt++, 8)));
+        setReconnectBanner(true, '握手超时，正在切换重连...');
         subInfo.textContent = '握手超时，正在切换重连...';
         reconnectTimer = setTimeout(connect, delay);
       }
@@ -5243,7 +5304,7 @@
 
     connectingBeacon = true;
     subInfo.textContent = '正在自动寻址连接电脑...';
-    resolveRemoteTunnelUrl(reconnectAttempt >= 2)
+    resolveRemoteTunnelUrl(reconnectAttempt >= 1)
       .then((tunnelOrigin) => {
         if (myEpoch !== connEpoch) return;
         connectingBeacon = false;
@@ -5312,6 +5373,8 @@
                 if (epochToken !== connEpoch || ws !== wsInstance) return;
                 if (inboundSeq === retrySeq && document.visibilityState !== 'hidden' && wsInstance.bufferedAmount <= 65536) {
                   connEpoch++;
+                  clearInterval(pingTimer);
+                  clearPongWatchdog();
                   ws = null;
                   try { wsInstance.close(); } catch (_) {}
                   connDot.className = 'conn-dot offline';
@@ -5322,6 +5385,8 @@
               return;
             }
             connEpoch++;
+            clearInterval(pingTimer);
+            clearPongWatchdog();
             ws = null;
             try { wsInstance.close(); } catch (_) {}
             connDot.className = 'conn-dot offline';
@@ -5367,6 +5432,9 @@
       if (data.type === 'hello') {
         serverCapabilities = data.capabilities || null;
         syncCapabilityControls();
+        if (Number.isFinite(Number(data.nav_seq))) {
+          lastAppliedNavSeq = Math.max(lastAppliedNavSeq, Number(data.nav_seq));
+        }
         const prevCid = activeConvId;
         const prevStore = activeConvStore;
         let remembered = null;
@@ -5379,6 +5447,7 @@
         if (targetReattachCid) {
           // Server restarted onto empty `default-chat` while mobile was viewing a PC conversation:
           // wait for `conversation_loaded` ack BEFORE flushing `outboundQueue` so `select` and `chat` never race!
+          pendingReattachCid = targetReattachCid;
           wsInstance.send(JSON.stringify({
             type: 'select_conversation',
             conversation_id: targetReattachCid,
@@ -5387,6 +5456,7 @@
           }));
           return;
         }
+        pendingReattachCid = '';
 
         activeSlot = data.slot || '';
         currentModelLabel = data.model || '';
@@ -5420,6 +5490,10 @@
       } else if (data.type === 'slots_overview') {
         applySlotsOverview(data);
       } else if (data.type === 'chat_ack') {
+        if (data.stage === 'duplicate_ignored' && data.client_id && data.client_id === optimisticWaitClientId) {
+          clearOptimisticPlaceholder();
+          if (!activeStreamMsgId) setStreamingState(false);
+        }
         const rcptEl = document.getElementById('rcpt-' + data.client_id);
         if (rcptEl && data.label) {
           rcptEl.textContent = data.label;
@@ -5463,6 +5537,10 @@
         renderMoreBentoGrid();
         syncAppChromeState();
       } else if (data.type === 'conversation_loaded') {
+        pendingReattachCid = '';
+        const msgNav = Number(data.nav_seq);
+        if (Number.isFinite(msgNav) && msgNav < lastAppliedNavSeq) return;
+        if (Number.isFinite(msgNav) && msgNav > lastAppliedNavSeq) lastAppliedNavSeq = msgNav;
         if (!data.silent) setMainView('home');
         const switchingSlot = !data.silent && data.slot && data.slot !== activeSlot;
         activeSlot = data.slot || activeSlot;
@@ -5614,8 +5692,10 @@
           notifyReplyFinished(data.item.text || '');
         }
       } else if (data.type === 'desktop_frame') {
-        const sep = mediaUrl(data.media_id).includes('?') ? '&' : '?';
-        const u = mediaUrl(data.media_id) + sep + '_t=' + data.ts;
+        if (data.media_id && data.media_ticket) rememberMediaTicket(data.media_id, data.media_ticket);
+        const mUrl = mediaUrl(data.media_id, data.media_ticket || '');
+        const sep = mUrl.includes('?') ? '&' : '?';
+        const u = mUrl + sep + '_t=' + data.ts;
         const dImg = $('deskImg');
         if (data.cursor && typeof data.cursor === 'object') {
           if (Number.isFinite(data.cursor.screen_w) && data.cursor.screen_w > 0) deskScreenW = Number(data.cursor.screen_w);
@@ -5646,6 +5726,7 @@
           closeDesktopModal();
         }
       } else if (data.type === 'upload_done') {
+        if (data.media_id && data.media_ticket) rememberMediaTicket(data.media_id, data.media_ticket);
         pendingAttachments.push(data);
         renderPendingAttachments();
         refreshSendBtnVisual();
@@ -5655,10 +5736,25 @@
           branchingInFlight = false;
           branchDraftByReq.delete(data.req_id);
         }
-        if (String(data.text || '').includes('未找到该对话记录') && !activeConvId) {
+        if (String(data.text || '').includes('未找到该对话记录') && (pendingReattachCid || !activeConvId)) {
+          const missedCid = pendingReattachCid;
+          pendingReattachCid = '';
           try { sessionStorage.removeItem('agy_active_conv_v1'); } catch (_) {}
+          if (missedCid && outboundQueue.length) {
+            const beforeLen = outboundQueue.length;
+            for (let qi = outboundQueue.length - 1; qi >= 0; qi--) {
+              const qSlot = String(outboundQueue[qi].slot || '');
+              if (qSlot === missedCid || qSlot.endsWith(':' + missedCid)) {
+                outboundQueue.splice(qi, 1);
+              }
+            }
+            if (outboundQueue.length < beforeLen) {
+              showToast('原对话已失效，已取消待发往旧对话的消息以免错投', 3600);
+            }
+          }
           renderHeroDeck();
           syncAppChromeState();
+          if (ws && ws.readyState === 1) flushOutboundQueue(ws);
         }
         showToast(data.text);
       }
@@ -5689,6 +5785,7 @@
           if (el) el.classList.remove('show');
         });
         subInfo.textContent = ev.code === 4001 ? '配对已撤销或会话过期，请重新扫码' : '非法来源拦截 (4003)';
+        mediaTicketCache.clear();
         try { localStorage.removeItem('agy_pwa_token'); } catch (_) {}
         token = '';
         syncManifestToken();
@@ -5779,6 +5876,8 @@
         wakeWatchdogActive = false;
         if (targetEpoch === connEpoch && ws === targetWs && inboundSeq === seqBeforeWake && document.visibilityState !== 'hidden' && targetWs.bufferedAmount <= 65536) {
           connEpoch++;
+          clearInterval(pingTimer);
+          clearPongWatchdog();
           ws = null;
           try { targetWs.close(); } catch (_) {}
           connDot.className = 'conn-dot offline';
@@ -5848,6 +5947,7 @@
   }
 
   function clearOptimisticPlaceholder() {
+    optimisticWaitClientId = '';
     if (optimisticWaitRowId) {
       const el = document.getElementById(optimisticWaitRowId);
       if (el) el.remove();
@@ -5912,6 +6012,7 @@
     if (isConnected) {
       if (!steeringMidTurn) {
         showOptimisticPlaceholder();
+        optimisticWaitClientId = clientId;
         setStreamingState(true);
       }
       ws.send(JSON.stringify(payload));
@@ -7456,14 +7557,16 @@
       : '';
     const bar = document.createElement('div');
     bar.style.cssText = 'display:flex;justify-content:space-between;align-items:center;gap:6px;margin-bottom:6px;flex-wrap:wrap';
-    const dlHtml = data.media_id ? `<a class="pill-btn" href="${mediaUrl(data.media_id)}" download="${escapeHtml(data.name || '')}" style="text-decoration:none">下载</a>` : '';
+    if (data.media_id && data.media_ticket) rememberMediaTicket(data.media_id, data.media_ticket);
+    const dlUrl = data.media_id ? mediaUrl(data.media_id, data.media_ticket || '') : '';
+    const dlHtml = dlUrl ? `<a class="pill-btn" href="${dlUrl}" download="${escapeHtml(data.name || '')}" style="text-decoration:none">下载</a>` : '';
     bar.innerHTML = `<button id="backFromFile" class="pill-btn">⬅ 返回</button><div style="display:flex;gap:6px;flex-wrap:wrap">${canvasBtnHtml}${dlHtml}<button id="quoteFileBtn" class="pill-btn" style="background:#fff;color:#0d0d0d">引用到对话</button></div>`;
     body.appendChild(bar);
 
     if (data.is_image && data.media_id) {
       const img = document.createElement('img');
       img.className = 'screen-frame';
-      img.src = mediaUrl(data.media_id);
+      img.src = mediaUrl(data.media_id, data.media_ticket || '');
       img.onclick = () => openLightbox(img.src);
       body.appendChild(img);
     } else {
