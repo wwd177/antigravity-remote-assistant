@@ -560,6 +560,17 @@ def publish_ios_pwa_and_beacon(
                 return (False, f"生成信标提交失败：{(c_res.stderr or c_res.stdout).strip()[:120]}")
 
             p_res = _git("push", "-f", "_beacon_target", f"HEAD:refs/heads/{target_branch}", timeout=30)
+            if p_res.returncode != 0 and sys.platform == "win32":
+                # Transient Windows schannel TLS retry using OpenSSL backend
+                p_res = _git(
+                    "-c",
+                    "http.sslBackend=openssl",
+                    "push",
+                    "-f",
+                    "_beacon_target",
+                    f"HEAD:refs/heads/{target_branch}",
+                    timeout=30,
+                )
             if p_res.returncode != 0:
                 return (False, f"推送 {target_branch} 失败：{(p_res.stderr or p_res.stdout).strip()[:140]}")
 
