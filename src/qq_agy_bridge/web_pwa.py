@@ -769,7 +769,7 @@ class WebPwaServer:
             self._media_registry.popitem(last=False)
         return media_id
 
-    async def _safe_send(self, ws: ServerConnection, raw_or_dict: str | dict[str, Any], timeout: float = 4.0) -> bool:
+    async def _safe_send(self, ws: ServerConnection, raw_or_dict: str | dict[str, Any], timeout: float = 15.0) -> bool:
         raw = raw_or_dict if isinstance(raw_or_dict, str) else json.dumps(raw_or_dict, ensure_ascii=False)
         try:
             await asyncio.wait_for(ws.send(raw), timeout=timeout)
@@ -788,10 +788,10 @@ class WebPwaServer:
         raw = json.dumps(payload, ensure_ascii=False)
         clients_snapshot = list(self._clients)
         if len(clients_snapshot) == 1:
-            await self._safe_send(clients_snapshot[0], raw, timeout=3.5)
+            await self._safe_send(clients_snapshot[0], raw, timeout=12.0)
             return
         await asyncio.gather(
-            *(self._safe_send(c, raw, timeout=3.5) for c in clients_snapshot),
+            *(self._safe_send(c, raw, timeout=12.0) for c in clients_snapshot),
             return_exceptions=True,
         )
 
@@ -808,6 +808,7 @@ class WebPwaServer:
                 ("Content-Type", content_type),
                 ("Content-Length", str(len(body))),
                 ("X-Content-Type-Options", "nosniff"),
+                ("Connection", "close"),
             ]
         )
         if extra_headers:
@@ -1012,6 +1013,31 @@ class WebPwaServer:
 
         uploads: dict[str, _UploadState] = {}
         live_screen_task: asyncio.Task[None] | None = None
+        ws_tasks: set[asyncio.Task[None]] = set()
+        inflight_keys: set[str] = set()
+        desk_input_lock = asyncio.Lock()
+        upload_q: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+        def _spawn_ws_task(coro: Any, *, coalesce_key: str = "") -> None:
+            if coalesce_key:
+                if coalesce_key in inflight_keys:
+                    if asyncio.iscoroutine(coro):
+                        coro.close()
+                    return
+                inflight_keys.add(coalesce_key)
+            t = asyncio.create_task(coro)
+            ws_tasks.add(t)
+
+            def _cleanup(done_t: asyncio.Task[None]) -> None:
+                ws_tasks.discard(done_t)
+                if coalesce_key:
+                    inflight_keys.discard(coalesce_key)
+                if not done_t.cancelled():
+                    exc = done_t.exception()
+                    if exc is not None:
+                        logger.debug("WS background handler error (%s): %s", coalesce_key or "task", exc)
+
+            t.add_done_callback(_cleanup)
 
         def _stop_live_screen() -> None:
             nonlocal live_screen_task
@@ -1019,55 +1045,158 @@ class WebPwaServer:
                 live_screen_task.cancel()
                 live_screen_task = None
 
-        self._clients.add(ws)
-        logger.info("反重力助手客户端已连接 (%s)", ip)
-        try:
-            slot = self._active_slot
-            session = self._session_for_slot(slot)
-            meta = self._slot_meta.get(slot, {})
-            active_cid, active_store = self._effective_slot_identity(slot, session)
-            pub_inflight = self._public_inflight(slot)
-            hello_model = (
-                "Antigravity 电脑端"
-                if active_store == "ide"
-                else ("Codex 电脑端" if active_store == "codex" else (session.model or "default"))
-            )
-            await ws.send(
-                json.dumps(
-                    {
-                        "type": "hello",
-                        "slot": slot,
-                        "model": hello_model,
-                        "workspace": str(session.workspace),
-                        "active_conversation_id": active_cid,
-                        "active_title": meta.get("title") or session.active_title or "",
-                        "active_store": active_store,
-                        "busy": pub_inflight is not None,
-                        "inflight": pub_inflight,
-                        "slots_overview": self._build_slots_overview(),
-                        "cooldowns": session.failover_pool.cooldown_summary(),
-                        "history": self._slot_history.get(slot, []),
-                    },
-                    ensure_ascii=False,
-                )
-            )
-
-            async for raw in ws:
-                if not isinstance(raw, str):
-                    continue
+        async def _upload_worker() -> None:
+            while True:
+                umsg = await upload_q.get()
                 try:
-                    msg = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(msg, dict):
-                    continue
+                    utype = umsg.get("type")
+                    if utype == "upload_init":
+                        if len(uploads) >= 8:
+                            await self._safe_send(ws, {"type": "toast", "level": "err", "text": "同时上传文件过多，请稍候"})
+                            continue
+                        uid = str(umsg.get("upload_id") or uuid.uuid4().hex)
+                        if uid in uploads:
+                            uploads.pop(uid).abort()
+                        safe_name = sanitize_filename(str(umsg.get("name") or "upload.bin"))
+                        size = int(umsg.get("size") or 0)
+                        if size < 0 or size > MAX_UPLOAD_BYTES:
+                            await self._safe_send(ws, {"type": "toast", "level": "err", "text": "文件超过 100MB 上限"})
+                            continue
+                        PROJECT_INBOX_DIR.mkdir(parents=True, exist_ok=True)
+                        dest = PROJECT_INBOX_DIR / f"pwa_{int(time.time())}_{uuid.uuid4().hex[:5]}_{safe_name}"
+                        uploads[uid] = _UploadState(dest, safe_name, size)
+                        await self._safe_send(ws, {"type": "upload_ack", "upload_id": uid})
+                    elif utype == "upload_chunk":
+                        uid = str(umsg.get("upload_id") or "")
+                        state = uploads.get(uid)
+                        if state is None:
+                            continue
+                        try:
+                            chunk_bytes = base64.b64decode(str(umsg.get("data") or ""))
+                            await asyncio.to_thread(state.write, chunk_bytes)
+                            await self._safe_send(
+                                ws,
+                                {
+                                    "type": "upload_progress",
+                                    "upload_id": uid,
+                                    "written": state.written,
+                                    "total": state.expected_size,
+                                },
+                            )
+                        except Exception as exc:
+                            state.abort()
+                            uploads.pop(uid, None)
+                            await self._safe_send(ws, {"type": "toast", "level": "err", "text": f"上传出错：{exc}"})
+                    elif utype == "upload_complete":
+                        uid = str(umsg.get("upload_id") or "")
+                        state = uploads.pop(uid, None)
+                        if state is None:
+                            continue
+                        try:
+                            final_path = await asyncio.to_thread(state.finalize)
+                        except Exception as exc:
+                            await self._safe_send(ws, {"type": "toast", "level": "err", "text": f"上传校验未通过：{exc}"})
+                            continue
+                        prune_inbox(PROJECT_INBOX_DIR, keep=40)
+                        mid = self.register_media(final_path)
+                        is_img = final_path.suffix.lower() in ALLOWED_IMAGE_EXTS
+                        await self._safe_send(
+                            ws,
+                            {
+                                "type": "upload_done",
+                                "upload_id": uid,
+                                "media_id": mid,
+                                "name": state.name,
+                                "path": str(final_path),
+                                "is_image": is_img,
+                            },
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.debug("Upload worker error: %s", exc)
+                finally:
+                    upload_q.task_done()
 
-                mtype = msg.get("type")
+        async def _run_desktop_frame() -> None:
+            try:
+                shot, cur_info = await asyncio.gather(
+                    asyncio.to_thread(capture_desktop_fast_jpeg_sync, PROJECT_INBOX_DIR),
+                    asyncio.to_thread(get_desktop_cursor_ratio),
+                )
+                mid = self.register_media(shot)
+                await self._safe_send(
+                    ws,
+                    {
+                        "type": "desktop_frame",
+                        "media_id": mid,
+                        "ts": int(time.time() * 1000),
+                        "cursor": cur_info,
+                    },
+                )
+            except Exception as exc:
+                await self._safe_send(ws, {"type": "toast", "level": "err", "text": f"截屏失败：{exc}"})
 
-                if mtype == "ping":
-                    await ws.send(json.dumps({"type": "pong", "ts": msg.get("ts")}))
+        async def _run_cancel(cmsg: dict[str, Any]) -> None:
+            cur_slot = str(cmsg.get("slot") or self._active_slot)
+            req_mid = str(cmsg.get("msg_id") or "")
+            inf = self._slot_inflight.get(cur_slot)
+            if req_mid and inf and str(inf.get("msg_id") or "") != req_mid:
+                await self._safe_send(ws, {"type": "toast", "level": "info", "text": "该轮生成已结束。"})
+                return
+            killed = False
+            if inf and inf.get("msg_id"):
+                self._cancelled_reply_ids.add(str(inf["msg_id"]))
+            if inf and inf.get("pc_ide_cid") and self._pc_window_canceller is not None:
+                killed = await asyncio.to_thread(self._pc_window_canceller, str(inf["pc_ide_cid"])) or True
+            proc_cdx = self._slot_codex_procs.get(cur_slot)
+            if proc_cdx is not None and proc_cdx.returncode is None:
+                try:
+                    if sys.platform == "win32" and proc_cdx.pid:
+                        await asyncio.to_thread(_kill_process_tree_win32, proc_cdx.pid)
+                    else:
+                        proc_cdx.terminate()
+                    killed = True
+                except Exception:
+                    pass
+            killed = (await self._session_for_slot(cur_slot).cancel_current()) or killed
+            note = "已停止当前生成。" if killed else "当前没有运行中的任务。"
+            await self._safe_send(ws, {"type": "toast", "level": "info", "text": note})
 
-                elif mtype == "desktop_frame":
+        async def _run_ide_actions_inspect(req_cid: str) -> None:
+            actions = await asyncio.to_thread(self._ide_actions_inspector, req_cid)
+            await self._safe_send(ws, {"type": "ide_actions", "actions": actions})
+
+        async def _run_ide_action_invoke(act_tok: str, req_cid: str) -> None:
+            ok, note = await asyncio.to_thread(self._ide_action_invoker, act_tok)
+            await self._safe_send(ws, {"type": "ide_action_result", "ok": ok, "note": note})
+            actions_after = await asyncio.to_thread(self._ide_actions_inspector, req_cid)
+            await self._safe_send(ws, {"type": "ide_actions", "actions": actions_after})
+
+        async def _run_desktop_input(dmsg: dict[str, Any]) -> None:
+            async with desk_input_lock:
+                act_kind = str(dmsg.get("action") or "")
+                kname = str(dmsg.get("key") or "")
+                txt_payload = str(dmsg.get("text") or "")
+                try:
+                    xr = 0.5 if act_kind in {"key", "hotkey", "type_text"} else float(dmsg.get("x_ratio") if dmsg.get("x_ratio") is not None else 0.5)
+                    yr = 0.5 if act_kind in {"key", "hotkey", "type_text"} else float(dmsg.get("y_ratio") if dmsg.get("y_ratio") is not None else 0.5)
+                except (TypeError, ValueError):
+                    await self._safe_send(ws, {"type": "toast", "level": "err", "text": "触控坐标参数无效"})
+                    return
+
+                def _invoke_desk_handler() -> tuple[bool, str]:
+                    try:
+                        return self._desktop_input_handler(act_kind, xr, yr, kname, txt_payload)
+                    except TypeError:
+                        return self._desktop_input_handler(act_kind, xr, yr, kname)
+
+                ok, note = await asyncio.to_thread(_invoke_desk_handler)
+                quiet_act = bool(dmsg.get("quiet")) or act_kind in {"move", "scroll_up", "scroll_down"}
+                if not ok or (not quiet_act and act_kind in {"hotkey", "type_text", "right_click", "double_click"}):
+                    await self._safe_send(ws, {"type": "toast", "level": "info" if ok else "err", "text": note})
+                if ok and live_screen_task is None:
+                    await asyncio.sleep(0.06 if act_kind == "move" else 0.16)
                     try:
                         shot, cur_info = await asyncio.gather(
                             asyncio.to_thread(capture_desktop_fast_jpeg_sync, PROJECT_INBOX_DIR),
@@ -1083,8 +1212,75 @@ class WebPwaServer:
                                 "cursor": cur_info,
                             },
                         )
-                    except Exception as exc:
-                        await self._safe_send(ws, {"type": "toast", "level": "err", "text": f"截屏失败：{exc}"})
+                    except Exception:
+                        pass
+
+        async def _run_pc_system_inspect() -> None:
+            session_cur = self._session_for_slot(self._active_slot)
+            sys_info, clip_info = await asyncio.gather(
+                asyncio.to_thread(self._pc_system_inspector, session_cur.workspace),
+                asyncio.to_thread(self._pc_clipboard_getter),
+            )
+            await self._safe_send(ws, {"type": "pc_system_state", "system": sys_info, "clipboard": clip_info})
+
+        async def _run_pc_clipboard_get() -> None:
+            clip_info = await asyncio.to_thread(self._pc_clipboard_getter)
+            await self._safe_send(ws, {"type": "pc_clipboard", **clip_info})
+
+        async def _run_pc_clipboard_set(txt_clip: str) -> None:
+            ok, note = await asyncio.to_thread(self._pc_clipboard_setter, txt_clip)
+            await self._safe_send(ws, {"type": "toast", "level": "info" if ok else "err", "text": note})
+
+        self._clients.add(ws)
+        upload_task: asyncio.Task[None] | None = None
+        logger.info("反重力助手客户端已连接 (%s)", ip)
+        try:
+            upload_task = asyncio.create_task(_upload_worker())
+            slot = self._active_slot
+            session = self._session_for_slot(slot)
+            meta = self._slot_meta.get(slot, {})
+            active_cid, active_store = self._effective_slot_identity(slot, session)
+            pub_inflight = self._public_inflight(slot)
+            hello_model = (
+                "Antigravity 电脑端"
+                if active_store == "ide"
+                else ("Codex 电脑端" if active_store == "codex" else (session.model or "default"))
+            )
+            await self._safe_send(
+                ws,
+                {
+                    "type": "hello",
+                    "slot": slot,
+                    "model": hello_model,
+                    "workspace": str(session.workspace),
+                    "active_conversation_id": active_cid,
+                    "active_title": meta.get("title") or session.active_title or "",
+                    "active_store": active_store,
+                    "busy": pub_inflight is not None,
+                    "inflight": pub_inflight,
+                    "slots_overview": self._build_slots_overview(),
+                    "cooldowns": session.failover_pool.cooldown_summary(),
+                    "history": self._slot_history.get(slot, []),
+                },
+            )
+
+            async for raw in ws:
+                if not isinstance(raw, str):
+                    continue
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(msg, dict):
+                    continue
+
+                mtype = msg.get("type")
+
+                if mtype == "ping":
+                    await self._safe_send(ws, {"type": "pong", "ts": msg.get("ts")})
+
+                elif mtype == "desktop_frame":
+                    _spawn_ws_task(_run_desktop_frame(), coalesce_key="desktop_frame")
 
                 elif mtype == "live_screen":
                     enable = bool(msg.get("enable"))
@@ -1093,6 +1289,7 @@ class WebPwaServer:
                         interval = max(0.6, min(5.0, float(msg.get("interval_ms") or 750) / 1000.0))
 
                         async def _stream_screen() -> None:
+                            timeout_streak = 0
                             while True:
                                 try:
                                     shot, cur_info = await asyncio.gather(
@@ -1102,17 +1299,22 @@ class WebPwaServer:
                                         asyncio.to_thread(get_desktop_cursor_ratio),
                                     )
                                     mid = self.register_media(shot)
-                                    ok_sent = await self._safe_send(
-                                        ws,
+                                    frame_raw = json.dumps(
                                         {
                                             "type": "desktop_frame",
                                             "media_id": mid,
                                             "ts": int(time.time() * 1000),
                                             "cursor": cur_info,
                                         },
+                                        ensure_ascii=False,
                                     )
-                                    if not ok_sent:
-                                        break
+                                    try:
+                                        await asyncio.wait_for(ws.send(frame_raw), timeout=8.0)
+                                        timeout_streak = 0
+                                    except asyncio.TimeoutError:
+                                        timeout_streak += 1
+                                        if timeout_streak >= 3:
+                                            break
                                 except asyncio.CancelledError:
                                     raise
                                 except Exception:
@@ -1121,103 +1323,14 @@ class WebPwaServer:
 
                         live_screen_task = asyncio.create_task(_stream_screen())
 
-                elif mtype == "upload_init":
-                    if len(uploads) >= 8:
-                        await ws.send(json.dumps({"type": "toast", "level": "err", "text": "同时上传文件过多，请稍候"}))
-                        continue
-                    uid = str(msg.get("upload_id") or uuid.uuid4().hex)
-                    if uid in uploads:
-                        uploads.pop(uid).abort()
-                    safe_name = sanitize_filename(str(msg.get("name") or "upload.bin"))
-                    size = int(msg.get("size") or 0)
-                    if size < 0 or size > MAX_UPLOAD_BYTES:
-                        await ws.send(json.dumps({"type": "toast", "level": "err", "text": "文件超过 100MB 上限"}))
-                        continue
-                    PROJECT_INBOX_DIR.mkdir(parents=True, exist_ok=True)
-                    dest = PROJECT_INBOX_DIR / f"pwa_{int(time.time())}_{uuid.uuid4().hex[:5]}_{safe_name}"
-                    uploads[uid] = _UploadState(dest, safe_name, size)
-                    await ws.send(json.dumps({"type": "upload_ack", "upload_id": uid}))
-
-                elif mtype == "upload_chunk":
-                    uid = str(msg.get("upload_id") or "")
-                    state = uploads.get(uid)
-                    if state is None:
-                        continue
-                    try:
-                        chunk_bytes = base64.b64decode(str(msg.get("data") or ""))
-                        await asyncio.to_thread(state.write, chunk_bytes)
-                        await ws.send(
-                            json.dumps(
-                                {
-                                    "type": "upload_progress",
-                                    "upload_id": uid,
-                                    "written": state.written,
-                                    "total": state.expected_size,
-                                }
-                            )
-                        )
-                    except Exception as exc:
-                        state.abort()
-                        uploads.pop(uid, None)
-                        await ws.send(json.dumps({"type": "toast", "level": "err", "text": f"上传出错：{exc}"}))
-
-                elif mtype == "upload_complete":
-                    uid = str(msg.get("upload_id") or "")
-                    state = uploads.pop(uid, None)
-                    if state is None:
-                        continue
-                    try:
-                        final_path = await asyncio.to_thread(state.finalize)
-                    except Exception as exc:
-                        await ws.send(json.dumps({"type": "toast", "level": "err", "text": f"上传校验未通过：{exc}"}))
-                        continue
-                    prune_inbox(PROJECT_INBOX_DIR, keep=40)
-                    mid = self.register_media(final_path)
-                    is_img = final_path.suffix.lower() in ALLOWED_IMAGE_EXTS
-                    await ws.send(
-                        json.dumps(
-                            {
-                                "type": "upload_done",
-                                "upload_id": uid,
-                                "media_id": mid,
-                                "name": state.name,
-                                "path": str(final_path),
-                                "is_image": is_img,
-                            },
-                            ensure_ascii=False,
-                        )
-                    )
+                elif mtype in {"upload_init", "upload_chunk", "upload_complete"}:
+                    upload_q.put_nowait(msg)
 
                 elif mtype == "cancel":
-                    cur_slot = str(msg.get("slot") or self._active_slot)
-                    req_mid = str(msg.get("msg_id") or "")
-                    inf = self._slot_inflight.get(cur_slot)
-                    if req_mid and inf and str(inf.get("msg_id") or "") != req_mid:
-                        await ws.send(
-                            json.dumps({"type": "toast", "level": "info", "text": "该轮生成已结束。"}, ensure_ascii=False)
-                        )
-                        continue
-                    killed = False
-                    if inf and inf.get("msg_id"):
-                        self._cancelled_reply_ids.add(str(inf["msg_id"]))
-                    if inf and inf.get("pc_ide_cid") and self._pc_window_canceller is not None:
-                        killed = await asyncio.to_thread(self._pc_window_canceller, str(inf["pc_ide_cid"])) or True
-                    proc_cdx = self._slot_codex_procs.get(cur_slot)
-                    if proc_cdx is not None and proc_cdx.returncode is None:
-                        try:
-                            if sys.platform == "win32" and proc_cdx.pid:
-                                await asyncio.to_thread(_kill_process_tree_win32, proc_cdx.pid)
-                            else:
-                                proc_cdx.terminate()
-                            killed = True
-                        except Exception:
-                            pass
-                    killed = (await self._session_for_slot(cur_slot).cancel_current()) or killed
-                    note = "已停止当前生成。" if killed else "当前没有运行中的任务。"
-                    await ws.send(json.dumps({"type": "toast", "level": "info", "text": note}, ensure_ascii=False))
+                    _spawn_ws_task(_run_cancel(msg))
 
                 elif mtype == "list_conversations":
-                    await self._handle_list_conversations(ws)
+                    _spawn_ws_task(self._handle_list_conversations(ws), coalesce_key="list_conversations")
 
                 elif mtype == "select_conversation":
                     max_m = int(msg.get("max_messages") or 200)
@@ -1265,99 +1378,36 @@ class WebPwaServer:
                     t.add_done_callback(self._tasks.discard)
 
                 elif mtype == "workspace_inspect":
-                    await self._handle_workspace_inspect(ws, str(msg.get("rel_dir") or ""))
+                    _spawn_ws_task(self._handle_workspace_inspect(ws, str(msg.get("rel_dir") or "")))
 
                 elif mtype == "workspace_diff":
-                    await self._handle_workspace_diff(ws, str(msg.get("path") or ""))
+                    _spawn_ws_task(self._handle_workspace_diff(ws, str(msg.get("path") or "")))
 
                 elif mtype == "workspace_file":
-                    await self._handle_workspace_file(ws, str(msg.get("path") or ""))
+                    _spawn_ws_task(self._handle_workspace_file(ws, str(msg.get("path") or "")))
 
                 elif mtype == "ide_actions_inspect":
-                    req_cid = str(msg.get("conversation_id") or "")
-                    actions = await asyncio.to_thread(self._ide_actions_inspector, req_cid)
-                    await ws.send(json.dumps({"type": "ide_actions", "actions": actions}, ensure_ascii=False))
+                    _spawn_ws_task(_run_ide_actions_inspect(str(msg.get("conversation_id") or "")))
 
                 elif mtype == "ide_action_invoke":
-                    act_tok = str(msg.get("action_token") or "")
-                    ok, note = await asyncio.to_thread(self._ide_action_invoker, act_tok)
-                    await ws.send(
-                        json.dumps({"type": "ide_action_result", "ok": ok, "note": note}, ensure_ascii=False)
+                    _spawn_ws_task(
+                        _run_ide_action_invoke(
+                            str(msg.get("action_token") or ""),
+                            str(msg.get("conversation_id") or ""),
+                        )
                     )
-                    actions_after = await asyncio.to_thread(
-                        self._ide_actions_inspector, str(msg.get("conversation_id") or "")
-                    )
-                    await ws.send(json.dumps({"type": "ide_actions", "actions": actions_after}, ensure_ascii=False))
 
                 elif mtype == "desktop_input":
-                    act_kind = str(msg.get("action") or "")
-                    kname = str(msg.get("key") or "")
-                    txt_payload = str(msg.get("text") or "")
-                    try:
-                        xr = 0.5 if act_kind in {"key", "hotkey", "type_text"} else float(msg.get("x_ratio") if msg.get("x_ratio") is not None else 0.5)
-                        yr = 0.5 if act_kind in {"key", "hotkey", "type_text"} else float(msg.get("y_ratio") if msg.get("y_ratio") is not None else 0.5)
-                    except (TypeError, ValueError):
-                        await self._safe_send(ws, {"type": "toast", "level": "err", "text": "触控坐标参数无效"})
-                        continue
-
-                    def _invoke_desk_handler() -> tuple[bool, str]:
-                        try:
-                            return self._desktop_input_handler(act_kind, xr, yr, kname, txt_payload)
-                        except TypeError:
-                            return self._desktop_input_handler(act_kind, xr, yr, kname)
-
-                    ok, note = await asyncio.to_thread(_invoke_desk_handler)
-                    quiet_act = bool(msg.get("quiet")) or act_kind in {"move", "scroll_up", "scroll_down"}
-                    if not ok or (not quiet_act and act_kind in {"hotkey", "type_text", "right_click", "double_click"}):
-                        await self._safe_send(
-                            ws,
-                            {"type": "toast", "level": "info" if ok else "err", "text": note},
-                        )
-                    if ok and live_screen_task is None:
-                        await asyncio.sleep(0.06 if act_kind == "move" else 0.16)
-                        try:
-                            shot, cur_info = await asyncio.gather(
-                                asyncio.to_thread(capture_desktop_fast_jpeg_sync, PROJECT_INBOX_DIR),
-                                asyncio.to_thread(get_desktop_cursor_ratio),
-                            )
-                            mid = self.register_media(shot)
-                            await self._safe_send(
-                                ws,
-                                {
-                                    "type": "desktop_frame",
-                                    "media_id": mid,
-                                    "ts": int(time.time() * 1000),
-                                    "cursor": cur_info,
-                                },
-                            )
-                        except Exception:
-                            pass
+                    _spawn_ws_task(_run_desktop_input(msg))
 
                 elif mtype == "pc_system_inspect":
-                    session_cur = self._session_for_slot(self._active_slot)
-                    sys_info, clip_info = await asyncio.gather(
-                        asyncio.to_thread(self._pc_system_inspector, session_cur.workspace),
-                        asyncio.to_thread(self._pc_clipboard_getter),
-                    )
-                    await ws.send(
-                        json.dumps(
-                            {"type": "pc_system_state", "system": sys_info, "clipboard": clip_info},
-                            ensure_ascii=False,
-                        )
-                    )
+                    _spawn_ws_task(_run_pc_system_inspect(), coalesce_key="pc_system_inspect")
 
                 elif mtype == "pc_clipboard_get":
-                    clip_info = await asyncio.to_thread(self._pc_clipboard_getter)
-                    await ws.send(json.dumps({"type": "pc_clipboard", **clip_info}, ensure_ascii=False))
+                    _spawn_ws_task(_run_pc_clipboard_get())
 
                 elif mtype == "pc_clipboard_set":
-                    ok, note = await asyncio.to_thread(self._pc_clipboard_setter, str(msg.get("text") or ""))
-                    await ws.send(
-                        json.dumps(
-                            {"type": "toast", "level": "info" if ok else "err", "text": note},
-                            ensure_ascii=False,
-                        )
-                    )
+                    _spawn_ws_task(_run_pc_clipboard_set(str(msg.get("text") or "")))
 
                 elif mtype == "chat":
                     req_slot = str(msg.get("slot") or self._active_slot)
@@ -1368,6 +1418,13 @@ class WebPwaServer:
             pass
         finally:
             _stop_live_screen()
+            to_cancel: list[asyncio.Task[None]] = list(ws_tasks)
+            if upload_task is not None:
+                to_cancel.append(upload_task)
+            for wt in to_cancel:
+                wt.cancel()
+            if to_cancel:
+                await asyncio.gather(*to_cancel, return_exceptions=True)
             for st in uploads.values():
                 st.abort()
             self._clients.discard(ws)
@@ -1385,22 +1442,20 @@ class WebPwaServer:
             asyncio.to_thread(inspect_workspace_git, session.workspace),
             asyncio.to_thread(list_workspace_directory, session.workspace, rel_dir),
         )
-        await ws.send(
-            json.dumps(
-                {
-                    "type": "workspace_state",
-                    "workspace": str(session.workspace),
-                    "git": git_info,
-                    "dir": dir_info,
-                },
-                ensure_ascii=False,
-            )
+        await self._safe_send(
+            ws,
+            {
+                "type": "workspace_state",
+                "workspace": str(session.workspace),
+                "git": git_info,
+                "dir": dir_info,
+            },
         )
 
     async def _handle_workspace_diff(self, ws: ServerConnection, rel_path: str) -> None:
         session = self._session_for_slot(self._active_slot)
         diff_res = await asyncio.to_thread(get_workspace_file_diff, session.workspace, rel_path)
-        await ws.send(json.dumps({"type": "workspace_diff", **diff_res}, ensure_ascii=False))
+        await self._safe_send(ws, {"type": "workspace_diff", **diff_res})
 
     async def _handle_workspace_file(self, ws: ServerConnection, rel_path: str) -> None:
         session = self._session_for_slot(self._active_slot)
@@ -1409,7 +1464,7 @@ class WebPwaServer:
             resolved = _resolve_inside_workspace(session.workspace, rel_path)
             if resolved is not None and is_safe_outbound_file(resolved, image_only=False):
                 prev["media_id"] = self.register_media(resolved)
-        await ws.send(json.dumps({"type": "workspace_file", **prev}, ensure_ascii=False))
+        await self._safe_send(ws, {"type": "workspace_file", **prev})
 
     def _convert_detail_to_pwa_history(self, detail: ConversationDetail, model_label: str) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
@@ -3241,8 +3296,9 @@ class WebPwaServer:
         serve_kwargs: dict[str, Any] = {
             "process_request": self._process_request,
             "compression": None,
-            "ping_interval": 20,
-            "ping_timeout": 20,
+            "ping_interval": 25,
+            "ping_timeout": 45,
+            "close_timeout": 5,
             "max_size": 16 * 1024 * 1024,
         }
         if sys.platform == "win32":
