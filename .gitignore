@@ -5,6 +5,7 @@
 .launcher_ui.json
 .continuation_map.json
 .gh_pages_stage/
+.runtime/
 
 # Personal runtime memory (template is tracked via user_profile.example.md)
 memory/user_profile.md

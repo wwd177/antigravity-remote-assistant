@@ -89,15 +89,17 @@ async def test_delivery_ack_states_pc_reject_accept_then_error_and_codex_started
     mock_codex_py = tmp_path / "mock_codex_ack.py"
     mock_codex_py.write_text(
         "import json, sys\n"
+        "sys.stdin.reconfigure(encoding='utf-8', errors='replace')\n"
+        "sys.stdout.reconfigure(encoding='utf-8', errors='replace')\n"
         "_ = sys.stdin.read()\n"
         "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'Codex 进程已真实启动并完成'}}, ensure_ascii=False), flush=True)\n",
         encoding="utf-8",
     )
     mock_codex_cmd = tmp_path / ("mock_codex_ack.cmd" if sys.platform == "win32" else "mock_codex_ack.sh")
     if sys.platform == "win32":
-        mock_codex_cmd.write_text(f'@chcp 65001 >nul\r\n@"{sys.executable}" "{mock_codex_py}" %*\r\n', encoding="utf-8")
+        mock_codex_cmd.write_text(f'@chcp 65001 >nul\r\n@"{sys.executable}" -X utf8 "{mock_codex_py}" %*\r\n', encoding="utf-8")
     else:
-        mock_codex_cmd.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{mock_codex_py}" "$@"\n', encoding="utf-8")
+        mock_codex_cmd.write_text(f'#!/bin/sh\nexec "{sys.executable}" -X utf8 "{mock_codex_py}" "$@"\n', encoding="utf-8")
         mock_codex_cmd.chmod(0o755)
 
     sender_mode = {"accept": False}
@@ -178,15 +180,18 @@ async def test_delivery_ack_states_pc_reject_accept_then_error_and_codex_started
                     break
             await ws.send(json.dumps({"type": "chat", "client_id": "cid-codex-1", "text": "codex ack test"}))
             cdx_acks: list[str] = []
+            cdx_end = None
             for _ in range(20):
                 ev = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
                 if ev.get("type") == "chat_ack" and ev.get("client_id") == "cid-codex-1":
                     cdx_acks.append(str(ev.get("stage")))
                 elif ev.get("type") == "stream_end":
+                    cdx_end = ev["item"]
                     break
             assert "started_cli" in cdx_acks
             assert "delivered_pc" not in cdx_acks
             assert "delivery_failed" not in cdx_acks
+            assert cdx_end is not None and "Codex 进程已真实启动并完成" in cdx_end["text"]
     finally:
         stop_event.set()
         await asyncio.wait_for(task, timeout=5.0)
